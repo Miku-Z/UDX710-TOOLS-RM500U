@@ -35,6 +35,11 @@ extern int serve_packed_file(struct mg_connection *c,
 /* 全局变量 */
 static struct mg_mgr g_mgr;
 static volatile int g_running = 0;
+static char g_listen_port[16] = "6677";
+
+const char *http_server_get_port(void) {
+  return g_listen_port;
+}
 
 /* 信号处理 */
 static void signal_handler(int sig) {
@@ -64,6 +69,8 @@ static int is_auth_whitelist(const char *uri, const char *method,
     if (strncmp(uri, "/api/charge/config", 18) == 0)
       return 1;
     if (strncmp(uri, "/api/current_band", 17) == 0)
+      return 1;
+    if (strncmp(uri, "/api/nr_radio_detail", 20) == 0)
       return 1;
   }
 
@@ -175,6 +182,8 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data) {
       handle_clear_cache(c, hm);
     } else if (mg_match(hm->uri, mg_str("/api/current_band"), NULL)) {
       handle_get_current_band(c, hm);
+    } else if (mg_match(hm->uri, mg_str("/api/nr_radio_detail"), NULL)) {
+      handle_nr_radio_detail(c, hm);
     }
     /* 高级网络 API */
     else if (mg_match(hm->uri, mg_str("/api/bands"), NULL)) {
@@ -212,13 +221,12 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (mg_match(hm->uri, mg_str("/api/claen/cron"), NULL)) {
       handle_clear_cron(c, hm);
     }
-    /* 充电控制 API */
+    /* 充电控制 API (RM500U-CN 无电池 PMIC，已禁用) */
     else if (mg_match(hm->uri, mg_str("/api/charge/config"), NULL)) {
-      handle_charge_config(c, hm);
-    } else if (mg_match(hm->uri, mg_str("/api/charge/on"), NULL)) {
-      handle_charge_on(c, hm);
-    } else if (mg_match(hm->uri, mg_str("/api/charge/off"), NULL)) {
-      handle_charge_off(c, hm);
+      HTTP_OK(c, "{\"Code\":0,\"Error\":\"\",\"Data\":{\"enabled\":false,\"start_threshold\":20,\"stop_threshold\":80}}");
+    } else if (mg_match(hm->uri, mg_str("/api/charge/on"), NULL) ||
+               mg_match(hm->uri, mg_str("/api/charge/off"), NULL)) {
+      HTTP_OK(c, "{\"Code\":1,\"Error\":\"RM500U-CN 无电池硬件，不支持充电控制\",\"Data\":null}");
     }
     /* 短信 API */
     else if (mg_match(hm->uri, mg_str("/api/sms"), NULL)) {
@@ -432,9 +440,9 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (mg_match(hm->uri, mg_str("/api/ipv6-proxy/send-logs"), NULL)) {
       handle_ipv6_proxy_send_logs(c, hm);
     }
-    /* 手机壳模式 API */
+    /* 手机壳模式 API (RM500U-CN 已禁用) */
     else if (mg_match(hm->uri, mg_str("/api/phone-case"), NULL)) {
-      handle_phone_case(c, hm);
+      HTTP_OK(c, "{\"enabled\":false,\"error\":\"RM500U-CN 不支持手机壳模式\"}");
     }
     /* 密保 API */
     else if (mg_match(hm->uri, mg_str("/api/security/status"), NULL)) {
@@ -469,8 +477,7 @@ int http_server_start(const char *port) {
   /* 初始化流量统计 */
   init_traffic();
 
-  /* 初始化充电控制 */
-  init_charge();
+  /* RM500U-CN 无电池 PMIC 与手机壳模式，跳过 init_charge() */
 
   /* 初始化短信模块（必须在auth_init之前，因为auth依赖数据库） */
   if (sms_init("6677.db") != 0) {
@@ -492,8 +499,7 @@ int http_server_start(const char *port) {
     printf("警告: Rathole模块初始化失败\n");
   }
 
-  /* 初始化手机壳模式模块 */
-  phone_case_init();
+  /* RM500U-CN 跳过 phone_case_init() */
 
   /* 初始化IPv6代理模块 */
   if (ipv6_proxy_init("6677.db") != 0) {
@@ -509,7 +515,8 @@ int http_server_start(const char *port) {
   mg_mgr_init(&g_mgr);
 
   /* 构建监听地址 - 使用 0.0.0.0 监听所有IPv4地址 */
-  snprintf(listen_addr, sizeof(listen_addr), "http://0.0.0.0:%s", port);
+  snprintf(g_listen_port, sizeof(g_listen_port), "%s", port ? port : "6677");
+  snprintf(listen_addr, sizeof(listen_addr), "http://0.0.0.0:%s", g_listen_port);
 
   /* 创建 HTTP 监听器 */
   if (mg_http_listen(&g_mgr, listen_addr, http_handler, NULL) == NULL) {

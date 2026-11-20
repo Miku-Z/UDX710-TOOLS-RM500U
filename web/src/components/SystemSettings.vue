@@ -329,7 +329,6 @@ let timeInterval = null
 onMounted(() => {
   fetchRebootConfig()
   fetchSystemTime()
-  fetchPhoneCaseStatus()
   timeInterval = setInterval(fetchSystemTime, 1000)
 })
 
@@ -392,24 +391,6 @@ onUnmounted(() => {
           <i class="fas fa-exclamation-triangle mr-2"></i>
           {{ t('settings.operationWarning') }}
         </p>
-      </div>
-
-      <!-- 手机壳模式 -->
-      <div class="mt-6 flex items-center justify-between p-4 bg-red-50 dark:bg-red-500/10 rounded-xl border border-red-200 dark:border-red-500/20">
-        <div class="flex items-center space-x-3">
-          <div class="w-10 h-10 rounded-lg bg-red-500/20 flex items-center justify-center">
-            <i class="fas fa-mobile-alt text-red-500 dark:text-red-400"></i>
-          </div>
-          <div>
-            <p class="text-slate-900 dark:text-white font-medium">{{ t('settings.phoneCaseMode') }}</p>
-            <p class="text-slate-500 dark:text-white/50 text-sm">{{ t('settings.phoneCaseModeDesc') }}</p>
-          </div>
-        </div>
-        <label class="relative cursor-pointer">
-          <input type="checkbox" :checked="phoneCaseEnabled" @click="togglePhoneCaseMode" :disabled="phoneCaseLoading" class="sr-only peer">
-          <div class="w-14 h-7 bg-slate-200 dark:bg-white/20 rounded-full peer peer-checked:bg-red-500 transition-colors"></div>
-          <div class="absolute top-0.5 left-0.5 w-6 h-6 bg-white rounded-full shadow transition-transform peer-checked:translate-x-7"></div>
-        </label>
       </div>
     </div>
 
@@ -620,60 +601,7 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- 手机壳模式警告弹窗 -->
     <Teleport to="body">
-      <Transition name="modal">
-        <div v-if="showPhoneCaseWarning" class="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div class="absolute inset-0 bg-black/60 backdrop-blur-sm" @click="cancelPhoneCaseWarning"></div>
-          <div class="relative w-full max-w-md bg-white dark:bg-slate-800 rounded-2xl shadow-2xl overflow-hidden">
-            <!-- 头部 -->
-            <div class="px-6 py-4 bg-red-500 text-white">
-              <h3 class="font-bold text-lg flex items-center">
-                <i class="fas fa-exclamation-triangle mr-2"></i>
-                {{ t('settings.dangerWarning') }}
-              </h3>
-            </div>
-            
-            <!-- 内容 -->
-            <div class="p-6">
-              <div class="text-slate-700 dark:text-white/80 text-sm whitespace-pre-line mb-6">
-                {{ t('settings.phoneCaseModeWarning') }}
-              </div>
-              
-              <!-- 确认输入 -->
-              <div class="mb-4">
-                <label class="block text-slate-600 dark:text-white/60 text-sm mb-2">
-                  {{ t('settings.inputToConfirm') }} "<span class="text-red-500 font-bold">{{ t('settings.phoneCaseVerification') }}</span>" {{ t('settings.toConfirm') }}
-                </label>
-                <input 
-                  v-model="phoneCaseVerifyText"
-                  type="text"
-                  :placeholder="t('settings.phoneCaseVerification')"
-                  class="w-full px-4 py-3 bg-slate-50 dark:bg-white/10 border border-slate-200 dark:border-white/20 rounded-xl text-slate-900 dark:text-white focus:border-red-400 focus:ring-2 focus:ring-red-400/20 transition-all"
-                >
-              </div>
-            </div>
-            
-            <!-- 底部按钮 -->
-            <div class="px-6 py-4 bg-slate-50 dark:bg-white/5 border-t border-slate-200 dark:border-white/10 flex justify-end space-x-3">
-              <button 
-                @click="cancelPhoneCaseWarning"
-                class="px-5 py-2.5 rounded-xl border border-slate-200 dark:border-white/10 text-slate-600 dark:text-white/60 hover:bg-slate-100 dark:hover:bg-white/10 transition-all"
-              >
-                {{ t('common.cancel') }}
-              </button>
-              <button 
-                @click="confirmPhoneCaseMode"
-                :disabled="phoneCaseVerifyText !== t('settings.phoneCaseVerification')"
-                class="px-5 py-2.5 rounded-xl bg-red-500 text-white hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-              >
-                {{ t('common.confirm') }}
-              </button>
-            </div>
-          </div>
-        </div>
-      </Transition>
-
       <!-- 恢复出厂设置弹窗 -->
       <Transition name="modal">
         <div v-if="showFactoryReset" class="fixed inset-0 z-50 flex items-center justify-center p-4">

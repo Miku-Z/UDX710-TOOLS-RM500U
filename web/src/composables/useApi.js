@@ -336,6 +336,11 @@ export async function usbAdvanceSwitch(mode) {
   })
 }
 
+// 获取 5G NR 4天线与调制/MIMO 详情
+export async function getNrRadioDetail() {
+  return request('/api/nr_radio_detail')
+}
+
 // ==================== APN配置API ====================
 
 // 获取APN列表

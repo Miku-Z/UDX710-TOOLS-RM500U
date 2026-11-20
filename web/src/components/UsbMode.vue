@@ -18,14 +18,16 @@ const hotSwitching = ref(false) // 热切换中
 // 模式值到名称的映射
 const modeValueToName = {
   1: 'CDC-NCM',
-  2: 'CDC-ECM', 
-  3: 'RNDIS'
+  2: 'CDC-ECM',
+  3: 'RNDIS',
+  4: 'MBIM'
 }
 
 const modeIdToValue = {
   'cdc_ncm': 1,
   'cdc_ecm': 2,
-  'rndis': 3
+  'rndis': 3,
+  'mbim': 4
 }
 
 // 获取当前USB模式
@@ -125,6 +127,19 @@ const modes = [
     btnPerm: 'from-green-700 to-green-800',
     shadow: 'shadow-green-500/30',
     text: 'text-green-500'
+  },
+  {
+    id: 'mbim',
+    name: 'MBIM',
+    icon: 'network-wired',
+    descKey: 'usb.mbimDesc',
+    gradient: 'from-purple-500 to-indigo-500',
+    gradientLight: 'from-purple-50 to-indigo-50',
+    gradientDark: 'from-purple-500/20 to-indigo-500/20',
+    btnTemp: 'from-purple-500 to-purple-600',
+    btnPerm: 'from-purple-700 to-purple-800',
+    shadow: 'shadow-purple-500/30',
+    text: 'text-purple-500'
   }
 ]
 
@@ -199,7 +214,7 @@ async function handleSwitch(mode, permanent) {
     </div>
 
     <!-- 模式卡片网格 -->
-    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6">
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6">
       <div 
         v-for="mode in modes" 
         :key="mode.id"
@@ -227,28 +242,7 @@ async function handleSwitch(mode, permanent) {
           
           <!-- 按钮组 -->
           <div class="space-y-3">
-            <!-- 热切换按钮（立即生效） -->
-            <button
-              @click="handleHotSwitch(mode)"
-              :disabled="loading !== null || currentMode === modeIdToValue[mode.id]"
-              :class="`w-full py-3 px-4 rounded-xl bg-gradient-to-r from-violet-500 to-purple-600 text-white font-medium text-sm shadow-lg shadow-violet-500/30 hover:shadow-xl hover:scale-[1.02] active:scale-[0.98] transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center space-x-2`"
-            >
-              <font-awesome-icon v-if="loading === `${mode.id}_hot`" icon="spinner" spin />
-              <font-awesome-icon v-else icon="bolt" />
-              <span>{{ t('usb.hotSwitch') }}</span>
-            </button>
-            
-            <!-- 临时切换按钮 -->
-            <button
-              @click="handleSwitch(mode, false)"
-              :disabled="loading !== null"
-              :class="`w-full py-3 px-4 rounded-xl bg-gradient-to-r ${mode.btnTemp} text-white font-medium text-sm shadow-lg ${mode.shadow} hover:shadow-xl hover:scale-[1.02] active:scale-[0.98] transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center space-x-2`"
-            >
-              <font-awesome-icon v-if="loading === `${mode.id}_temp`" icon="spinner" spin />
-              <span>{{ t('usb.tempMode') }}</span>
-            </button>
-            
-            <!-- 永久切换按钮 -->
+            <!-- 永久切换按钮 (写入 /mnt/data/usbenum.ini，重启生效) -->
             <button
               @click="handleSwitch(mode, true)"
               :disabled="loading !== null"
@@ -269,9 +263,8 @@ async function handleSwitch(mode, permanent) {
         <div class="text-sm text-amber-800 dark:text-amber-200">
           <p class="font-medium mb-1">{{ t('usb.notes') }}</p>
           <ul class="list-disc list-inside space-y-1 text-amber-700 dark:text-amber-300/80">
-            <li><span class="font-medium text-violet-600 dark:text-violet-400">{{ t('usb.noteHot').split('：')[0] }}</span>：{{ t('usb.noteHot').split('：')[1] }}</li>
-            <li><span class="font-medium">{{ t('usb.noteTemp').split('：')[0] }}</span>：{{ t('usb.noteTemp').split('：')[1] }}</li>
-            <li><span class="font-medium">{{ t('usb.notePerm').split('：')[0] }}</span>：{{ t('usb.notePerm').split('：')[1] }}</li>
+            <li>通过 <code>/mnt/data/usbenum.ini</code> 中的 <code>virtualcn</code> 切换 USB 网卡模式，保存后需重启模组生效。</li>
+            <li>MBIM 模式下需由上位机主动触发拨号；NCM 适用于 Linux 原生驱动；Windows 推荐 RNDIS。</li>
           </ul>
         </div>
       </div>

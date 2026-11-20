@@ -33,7 +33,9 @@ typedef struct {
     char passwd[64];
     char select_network_mode[32];
     int is_activated;
-    char serial[32];
+    char serial[72];
+    char model[64];
+    char fw_version[96];
     char network_mode[32];
     int airplane_mode;
     char imei[20];

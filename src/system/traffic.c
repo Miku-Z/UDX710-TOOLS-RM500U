@@ -51,7 +51,8 @@ static void get_traffic_from_vnstat(long long *rx, long long *tx) {
     *rx = 0;
     *tx = 0;
 
-    if (run_command(output, sizeof(output), "/home/root/6677/vnstat", 
+    const char *vnstat_bin = (access("./vnstat", X_OK) == 0) ? "./vnstat" : "/home/root/6677/vnstat";
+    if (run_command(output, sizeof(output), vnstat_bin, 
                     "-i", NETWORK_IFACE, "--json", NULL) != 0) {
         return;
     }
@@ -104,13 +105,20 @@ static void *flow_control_thread_func(void *arg) {
 static void init_vnstat_db(void) {
     struct stat st;
     char output[256];
+    const char *vnstat_bin = (access("./vnstat", X_OK) == 0) ? "./vnstat" : "/home/root/6677/vnstat";
+    const char *vnstatd_bin = (access("./vnstatd", X_OK) == 0) ? "./vnstatd" : "/home/root/6677/vnstatd";
+    const char *vnstatd_conf = (access("./vnstatd.conf", R_OK) == 0) ? "./vnstatd.conf" : "/home/root/6677/vnstatd.conf";
+
     if (stat(VNSTAT_DB, &st) != 0) {
-        run_command(output, sizeof(output), "/home/root/6677/vnstatd", "--initdb", NULL);
+        run_command(output, sizeof(output), vnstatd_bin, "--initdb", NULL);
         char cmd[256];
-        snprintf(cmd, sizeof(cmd), "/home/root/6677/vnstat --add -i %s", NETWORK_IFACE);
+        snprintf(cmd, sizeof(cmd), "%s --add -i %s", vnstat_bin, NETWORK_IFACE);
         run_command(output, sizeof(output), "sh", "-c", cmd, NULL);
     }
-    run_command(output, sizeof(output), "/home/root/6677/vnstatd", "--noadd", "--config", "/home/root/6677/vnstatd.conf", "-d", NULL);
+    /* 若已有 vnstatd 在运行（例如共存测试实例），不重复启动 */
+    if (system("pgrep -x vnstatd >/dev/null 2>&1") != 0) {
+        run_command(output, sizeof(output), vnstatd_bin, "--noadd", "--config", vnstatd_conf, "-d", NULL);
+    }
 }
 
 /* 初始化流量统计 */

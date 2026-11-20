@@ -72,7 +72,22 @@ int set_network_mode_for_slot(const char *mode, const char *slot) {
     }
 
     if (ofono_network_set_mode_sync(ril_path, mode_code, OFONO_TIMEOUT_MS) != 0) {
-        return -1;
+        /* ofono RadioSettings 不可用时，回退至标准 AT+SPTESTMODE 制式切换 */
+        extern int execute_at(const char *command, char **result);
+        int sptest = -1;
+        if (strcmp(mode, "lte_only") == 0) sptest = 24;
+        else if (strcmp(mode, "nr_5g_only") == 0) sptest = 131;
+        else if (strcmp(mode, "nr_5g_lte_auto") == 0) sptest = 152;
+        else if (strcmp(mode, "nsa_only") == 0) sptest = 128;
+
+        if (sptest < 0) return -1;
+        char cmd[64];
+        char *at_res = NULL;
+        snprintf(cmd, sizeof(cmd), "AT+SPTESTMODE=%d,%d", sptest, sptest);
+        int rc = execute_at(cmd, &at_res);
+        int ok = (rc == 0 && at_res && strstr(at_res, "ERROR") == NULL);
+        if (at_res) g_free(at_res);
+        return ok ? 0 : -1;
     }
 
     return 0;

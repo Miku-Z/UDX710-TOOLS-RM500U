@@ -77,7 +77,7 @@
 
   // 顶部状态栏
   header: {
-    title: '5G-MIFI',
+    title: 'RM500U-CN',
     subtitle: '管理中心',
     realtimeMonitor: '实时监控设备状态',
     openSource: '开源项目'
@@ -753,6 +753,7 @@
     rebootMsgPerm: '必须重启才能生效，是否立即重启？',
     rebootMsgTemp: '是否立即重启以应用变更？',
     rebooting: '系统正在重启...',
+    mbimDesc: 'Windows 10/11 和 Linux 原生移动宽带协议（virtualcn=3），需由上位机主动拨号。',
     notes: '注意事项',
     noteHot: '热切换：立即生效，USB连接会短暂断开约2秒',
     noteTemp: '临时模式：重启后生效，再次重启恢复默认',

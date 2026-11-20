@@ -22,6 +22,8 @@ void handle_device_control(struct mg_connection *c, struct mg_http_message *hm);
 void handle_clear_cache(struct mg_connection *c, struct mg_http_message *hm);
 void handle_get_current_band(struct mg_connection *c,
                              struct mg_http_message *hm);
+void handle_nr_radio_detail(struct mg_connection *c,
+                            struct mg_http_message *hm);
 
 /* 短信 API */
 void handle_sms_list(struct mg_connection *c, struct mg_http_message *hm);

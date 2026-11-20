@@ -1,298 +1,78 @@
-# 5G MiFi 管理面板(UDX710)
+# RM500U-CN 管理中心（UDX710-TOOLS 适配版）
 
-基于Web的5G MiFi设备管理界面，运行于嵌入式Linux系统（aarch64）。
+[🇺🇸 English README](README.md)
 
-> ⭐ **如果觉得这个项目有用，请点个Star支持一下！** 辛苦肝了一周的后台，您的支持是我最大的动力！
+基于开源项目 [LeoChen-CoreMind/UDX710-TOOLS](https://github.com/LeoChen-CoreMind/UDX710-TOOLS) 修改适配，面向 **RM500U-CN（UNISOC UDX710 平台）+ 有线网卡转接板（如 PCIe RTL8168 / eth0）** 的轻量级嵌入式 5G Web 管理后台。
 
-## 📦 版本说明
+---
 
-本项目提供两个版本，满足不同设备需求：
+## 相比原版的主要改动
 
-| 版本类型 | 适用设备 | Git分支 | 功能支持 | 说明 |
-|:---:|:---:|:---:|:---:|:---|
-| **UDX710 通用版** | 展锐UDX710平台通用 | `main` | ⭐ 基础功能集 | 适用于大多数UDX710设备 |
-| **SZ50 专用版** | SZ50随身WiFi | `SZ50` | 🌟 全功能支持 | 额外支持：LED灯控制、按键监听、WiFi控制、恢复出厂设置、设备接入管理 |
+### 1. 5G NR 射频与硬件监控增强（`/api/nr_radio_detail`）
+- **四天线实时监测**：展示 `ANT0–ANT3` 各自实时 RSRP 与 SINR。
+- **准确的 MIMO / 调制 / MCS / 带宽显示**：
+  - 修复 `AT+SP5GCMDS="get nr synch_param",16` 字段偏移及非 NR 驻网保护；
+  - 修正活跃下载时误判“待机”以及下行 MIMO 层数错映射到上行的问题，准确区分 `4R 单流 (1层)`、`2x2 MIMO (2层)`、`4x4 MIMO (3层/4层)` 与 `4x4 就绪 (待机)`；
+  - 新增信道带宽（MHz / RB）、Point-A ARFCN、VoNR/VoLTE + SMS IMS 注册状态显示；
+  - 前端为 `/api/nr_radio_detail` 增加带防重入锁的 **2.5 秒** 独立快速轮询，实时捕捉空口突发调度。
+- **多温区与板卡状态**：新增 SoC、5G 基带（NRCP）、5G 功放（PA5G）、主板多路温度监测，CPU 主频显示、`eth0` 有线网口协商速率/双工状态，并修正内存 Cache 统计。
 
-> 💡 **切换版本**: `git checkout SZ50` 切换到SZ50专用版，`git checkout main` 切换到通用版
+### 2. 5G SA 短信收发全链路修复
+- 启动与后台线程自动启用 `AT+IMSEN=1`、配置 `AT+CPMS="ME","ME","ME"` 与 `AT+CNMI=2,1,0,0,0`，无需人工敲 AT。
+- 新增 `ME -> SQLite` 自动 PDU 排空与 5 秒去重，支持中文/长短信 **UDH 分片重组** 与真实发送状态回执（`MessageState`）。
+- 移除原版遗留的“R106 短信修复”手动开关。
 
-### 📥 软件下载
+### 3. RM500U-CN 平台适配与功能精简
+- **系统信息与选网**：支持从 `/etc/quectel-project-name` 读取型号与固件版本（`AT+CGMR` 兜底），兼容 `/proc/cpuinfo` 十六进制 `Serial`，选网优先走 `org.ofono.RadioSettings` 并支持 `AT+SPTESTMODE` 回退，主小区频段支持 `AT+SPENGMD` 兜底。
+- **USB 网卡模式重构**：移除原版高风险 configfs/IPA 热切换，改为直接读写 `/mnt/data/usbenum.ini`（`virtualcn`）+ `sync()` 落盘，支持 **RNDIS / CDC-ECM / CDC-NCM / MBIM**，重启后生效。
+- **网络工具兼容**：兼容 `net-tools 2.x` 的 `ifconfig` 输出格式（`eth0:` 冒号与 `ether` 字段）。
+- **裁剪非 RM500U-CN 硬件项**：禁用电池/充电控制、手机壳模式、OTA 在线更新弹窗及无效的 SIM 卡槽 2 页面。
+- **路径与端口解耦**：`vnstat`、`rathole`、`Plugins` 优先使用当前目录相对路径（`./`），支持指定任意端口启动（如 `./server 6688`）。
 
-| 版本 | 下载链接 |
-|:---:|:---:|
-| **UDX710 通用版** | [📥 点击下载](https://github.com/LeoChen-CoreMind/UDX710-UOOLS/releases/latest) |
-| **SZ50 专用版** | [📥 点击下载](https://github.com/LeoChen-CoreMind/UDX710-UOOLS/releases/latest) |
+---
 
-### SZ50专用版额外功能
-- 🔆 **LED灯控制** - 自定义LED指示灯状态
-- 🔘 **按键监听** - 物理按键事件响应
-- 📶 **WiFi控制** - 完整的WiFi AP管理
-- 🔄 **恢复出厂设置** - 一键恢复默认配置
-- 👥 **设备接入管理** - 管理连接的客户端设备
+## 编译指南
 
-## ✨ 性能亮点
+### GitHub Actions 自动编译
+推送代码后，[`.github/workflows/build.yml`](.github/workflows/build.yml) 会自动下载 ARM 官方 `gcc-arm-9.2-2019.12`（`aarch64-none-linux-gnu`，目标 `GLIBC 2.30`，兼容模块 `GLIBC 2.31`）与 Node.js，编译并产出可直接部署的 Artifact（包含 `server`、`dist/`、`start.sh`）。
 
-| 指标 | 本项目 | 传统方案 (8080) |
-|------|--------|----------------|
-| **打包体积** | ~200 KB | ~6 MB |
-| **内存占用** (运行7小时) | ~1 MB | 高得多 |
+### 本地手动交叉编译
+> 注意：模块系统内置为 `GLIBC 2.31`，请使用兼容 `GLIBC <= 2.31` 的交叉工具链（例如 ARM 官方 GCC 9.2），避免使用高版本 Ubuntu 默认编译器导致模块运行报 `GLIBC` 版本不兼容。
 
-轻量、高效，完美适配资源受限的嵌入式设备！
-
-## 📸 界面预览
-
-| 系统监控 | 网络管理 | 高级网络 |
-|:---:|:---:|:---:|
-| <img src="docs/screenshot1.png" width="250" /> | <img src="docs/screenshot2.png" width="250" /> | <img src="docs/screenshot3.png" width="250" /> |
-
-| 短信管理 | 流量统计 | 充电控制 |
-|:---:|:---:|:---:|
-| <img src="docs/screenshot5.png" width="250" /> | <img src="docs/screenshot6.png" width="250" /> | <img src="docs/screenshot7.png" width="250" /> |
-
-| 系统更新 | AT调试 | Web终端 |
-|:---:|:---:|:---:|
-| <img src="docs/screenshot8.png" width="250" /> | <img src="docs/screenshot9.png" width="250" /> | <img src="docs/screenshot10.png" width="250" /> |
-
-| USB模式 | 系统设置 |
-|:---:|:---:|
-| <img src="docs/screenshot11.png" width="250" /> | <img src="docs/screenshot12.png" width="250" /> |
-
-| APN设置 | 插件商城 |
-|:---:|:---:|
-| <img src="docs/screenshot13.png" width="250" /> | <img src="docs/screenshot14.png" width="250" /> |
-
-## 功能特性
-
-### 网络管理
-- **Modem控制**：查看IMEI、ICCID、运营商信息、信号强度
-- **频段信息**：实时显示网络类型、频段、ARFCN、PCI、RSRP、RSRQ、SINR
-- **小区管理**：查看和管理蜂窝网络连接
-- **流量统计**：通过vnstat集成监控数据使用量
-- **流量控制**：设置流量限制和自动断网
-
-### WiFi管理
-- **AP模式**：配置WiFi热点（SSID、密码、信道）
-- **客户端管理**：查看已连接设备、踢出客户端
-- **DHCP设置**：配置IP范围和租约时间
-
-### 系统功能
-- **系统监控**：CPU、内存、温度监控
-- **短信管理**：收发短信，支持Webhook转发
-- **IPv6端口转发**：完整的IPv6端口转发服务
-  - 本地IPv4端口映射到IPv6地址
-  - 自动检测IPv6地址
-  - IPv6地址变化时Webhook通知
-  - 支持开机自启动
-  - 发送日志带响应追踪
-- **内网穿透（Rathole）**：内置Rathole客户端实现NAT穿透
-  - 多服务配置
-  - 自动生成服务端配置
-  - 实时连接状态
-  - 支持开机自启动
-- **LED控制**：管理设备LED指示灯
-- **飞行模式**：切换飞行模式
-- **电源管理**：电池状态、充电控制
-- **USB模式切换**：在CDC-ECM、CDC-NCM、RNDIS三种USB网络模式间切换
-  - 临时模式：重启后生效，再次重启恢复默认
-  - 永久模式：永久保存，所有重启后都生效
-- **APN设置**：自定义APN接入点配置
-  - 预设运营商配置（中国移动/联通/电信）
-  - 自定义APN、用户名、密码
-  - 支持多种认证协议（PAP/CHAP）
-- **插件商城**：可扩展的插件系统
-  - 支持自定义JS+HTML插件
-  - 内置Shell脚本执行API
-  - 脚本管理（上传/编辑/删除）
-  - 插件导入/导出功能
-- **OTA更新**：空中固件升级
-- **恢复出厂**：恢复设备默认设置
-- **Web终端**：远程Shell访问
-- **AT调试**：直接AT命令接口
-
-### UI特性
-- **深色模式**：完整的深色/浅色主题支持
-- **响应式设计**：移动端和桌面端优化
-- **实时更新**：数据实时刷新
-- **中文界面**：原生中文语言支持
-
-### 安全特性
-- **后台认证**：密码保护的管理界面
-  - 默认密码：`admin`（首次登录后建议修改）
-  - Token认证机制，支持自动过期
-  - 记住密码功能
-  - 修改密码支持
-
-## 项目架构
-
-```
-├── src/                    # 后端 (C语言)
-│   ├── main.c              # 入口点
-│   ├── mongoose.c/h        # HTTP服务器 (Mongoose)
-│   ├── packed_fs.c         # 嵌入式静态文件
-│   ├── handlers/           # HTTP API处理器
-│   │   ├── http_server.c   # 路由定义
-│   │   └── handlers.c      # API实现
-│   └── system/             # 系统模块
-│       ├── sysinfo.c       # 系统信息
-│       ├── wifi.c          # WiFi控制
-│       ├── sms.c           # 短信管理
-│       ├── traffic.c       # 流量统计
-│       ├── modem.c         # Modem控制
-│       ├── ofono.c         # oFono D-Bus集成
-│       ├── led.c           # LED控制
-│       ├── charge.c        # 电池管理
-│       ├── airplane.c      # 飞行模式
-│       ├── usb_mode.c      # USB模式切换
-│       ├── plugin.c        # 插件系统
-│       ├── update.c        # OTA更新
-│       ├── factory_reset.c # 恢复出厂
-│       └── ...
-└── web/                    # 前端 (Vue 3)
-    ├── src/
-    │   ├── App.vue         # 主应用
-    │   ├── components/     # Vue组件
-    │   ├── composables/    # Vue组合式函数
-    │   └── plugins/        # 插件 (FontAwesome)
-    ├── index.html
-    ├── package.json
-    ├── vite.config.js
-    └── tailwind.config.js
-```
-
-## 环境要求
-
-### 后端
-- GCC交叉编译器 (aarch64-linux-gnu)
-- GLib 2.0 (D-Bus支持)
-- 目标平台：Linux aarch64（嵌入式设备）
-
-### 前端
-- Node.js 18+
-- npm 或 yarn
-
-## 编译说明
-
-### 前端编译
 ```bash
+# 1. 构建前端静态资源
 cd web
 npm install
 npm run build
+
+# 2. 交叉编译后端（aarch64）
+cd ../src
+make CC=aarch64-none-linux-gnu-gcc STRIP=aarch64-none-linux-gnu-strip
+# 产物位于 src/build/ofono-server
 ```
 
-### 后端编译
-```bash
-# 将前端打包到C源码
-cd src
-# 从 web/dist 生成 packed_fs.c
+---
 
-# 交叉编译到aarch64
-make
-```
+## 模块端部署说明
 
-### Makefile配置
-后端使用交叉编译，目标平台为aarch64-linux-gnu。请确保工具链正确配置。
+1. 将编译产物 `src/build/ofono-server`（重命名为 `server`）与 `web/dist/` 上传至模块目录（例如 `/home/root/6677/` 或 `/home/root/6688/`）。
+2. 如从原版升级，直接覆盖旧目录中的 `server` 和 `dist/` 即可保留原有数据库与配套工具；全新空白目录如需流量统计和内网穿透，请自行放置 `vnstat`、`vnstatd`、`vnstatd.conf`、`rathole` 到同目录（短信所需的 `sqlite3` 模块系统通常已内置）。
+3. 启动服务（默认端口 `6677`，也可通过第一个参数自定义端口）：
+   ```sh
+   chmod +x server start.sh
+   ./start.sh 6688
+   ```
+4. 浏览器访问 `http://<模块IP>:6688`（默认密码 `admin`）。
 
-## API接口
+### 前提条件说明
+- 本仓库仅包含 WebUI 与后台服务，**不包含**外接转接板的 PCIe 网卡内核驱动（如 `r8169.ko` / `yt6801.ko`）及系统级网络初始化脚本，部署前请确保模块网络与 `ofonod` 服务已正常运行。
+- 5G SA 下收发短信需要 SIM 卡已开通运营商 VoLTE / IMS 短信业务。
 
-| 接口 | 方法 | 描述 |
-|------|------|------|
-| `/api/sysinfo` | GET | 系统信息 |
-| `/api/wifi/config` | GET/POST | WiFi配置 |
-| `/api/wifi/clients` | GET | 已连接客户端 |
-| `/api/sms/list` | GET | 短信列表 |
-| `/api/sms/send` | POST | 发送短信 |
-| `/api/traffic/stats` | GET | 流量统计 |
-| `/api/traffic/limit` | POST | 设置流量限制 |
-| `/api/modem/info` | GET | Modem信息 |
-| `/api/band/current` | GET | 当前频段信息 |
-| `/api/led/status` | GET/POST | LED控制 |
-| `/api/airplane` | GET/POST | 飞行模式 |
-| `/api/usb/mode` | GET/POST | USB模式切换 (CDC-ECM/CDC-NCM/RNDIS) |
-| `/api/apn` | GET/POST | APN配置管理 |
-| `/api/plugins` | GET/POST/DELETE | 插件管理 |
-| `/api/scripts` | GET/POST/PUT/DELETE | 脚本管理 |
-| `/api/shell` | POST | 执行Shell命令 |
-| `/api/ipv6-proxy/config` | GET/POST | IPv6代理配置 |
-| `/api/ipv6-proxy/rules` | GET/POST/DELETE | IPv6转发规则 |
-| `/api/ipv6-proxy/status` | GET | IPv6代理状态 |
-| `/api/ipv6-proxy/send-logs` | GET | IPv6发送日志 |
-| `/api/rathole/config` | GET/POST | Rathole配置 |
-| `/api/rathole/services` | GET/POST/DELETE | Rathole服务管理 |
-| `/api/rathole/status` | GET | Rathole连接状态 |
-| `/api/rathole/logs` | GET | Rathole日志 |
-| `/api/update/check` | GET | 检查更新 |
-| `/api/update/install` | POST | 安装更新 |
-| `/api/factory-reset` | POST | 恢复出厂设置 |
-| `/api/reboot` | POST | 重启设备 |
+---
 
-## 依赖库
+## 版权声明、修改说明与开源协议
 
-### 后端依赖
-- [Mongoose](https://github.com/cesanta/mongoose) - 嵌入式HTTP服务器
-- GLib/GIO - 与oFono的D-Bus通信
-
-### 前端依赖
-- Vue 3 - UI框架
-- Vite - 构建工具
-- TailwindCSS - 样式框架
-- FontAwesome - 图标库
-
-## 🌐 远程管理与网页控制
-
-内置轻量级 Web Server，可通过浏览器访问控制界面。
-
-**支持功能**：设备状态卡片、实时性能监控、网络控制与调试
-
-| 版本 | 默认访问地址 |
-|:---:|:---|
-| UDX710 通用版 | `http://设备IP:6677` |
-| SZ50 专用版 | `http://设备IP:80` |
-
-```bash
-# 启动程序（默认端口）
-./server
-
-# 自定义端口启动
-./server 80
-```
-
-## 📜 开源协议
-
-本项目采用 **GPLv3** 协议，这是强 Copyleft 协议：
-
-| ✅ 允许 | ⚠️ 必须 | ❌ 禁止 |
-|:---|:---|:---|
-| 自由使用、修改、分发 | 保留版权声明 | 闭源商业化 |
-| 分发修改版本 | 公开源代码（分发时） | 删除版权信息 |
-| | 使用相同协议 | 更改为其他协议 |
-
-详见 [LICENSE](LICENSE)
-
-## 🙏 致谢
-
-在此感谢以下贡献者对本项目的支持：
-
-| 贡献者 | 贡献内容 |
-|:---:|:---|
-| **等不住** | 提供各种AT指令 |
-| **黑衣剑士** | 提供USB模式切换 |
-| **Voodoo** | Glib编译环境 |
-| **1orz** | [project-cpe](https://github.com/1orz/project-cpe) 开源项目 |
-| **LeoChen** | 项目作者 |
-
-感谢各位网友的支持与反馈！
-
-## ☕ 支持项目
-
-本项目完全开源免费，如果你喜欢这个项目的话，也可以请我喝一杯咖啡~
-
-| 支付宝 | 微信赞赏 | QQ群 |
-|:---:|:---:|:---:|
-| <img src="docs/alipay.png" width="200" /> | <img src="docs/wechat.png" width="200" /> | <img src="docs/qq_group.png" width="200" /> |
-
-## 💬 社区讨论
-
-欢迎加入群聊一起讨论！
-
-- **QQ群**: 1029148488
-
-欢迎提交 Issue / Pull Request 一起完善项目 💡
+- **上游原项目**：[LeoChen-CoreMind/UDX710-TOOLS](https://github.com/LeoChen-CoreMind/UDX710-TOOLS)，原始代码版权归原作者及贡献者所有。
+- **修改声明**：本衍生版本于 **2026 年 11 月** 基于上述上游代码进行了大幅修改与平台适配，以支持 RM500U-CN 平台、5G SA 短信收发及 4 天线 NR 监控等功能。
+- **开源协议**：遵循原项目相同的 **GNU General Public License v3.0 (GPLv3)** 协议开源（完整协议文本见 [LICENSE](LICENSE)）。
+- **免责声明**：本软件按“原样（AS-IS）”提供，不附带任何明示或暗示担保；锁频、切换 USB 网卡模式或系统配置操作均存在断网或变砖风险，请使用者自行评估承担风险。

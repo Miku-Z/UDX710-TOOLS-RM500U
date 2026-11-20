@@ -26,8 +26,8 @@
 #define RATHOLE_LOG_MAX_LINES       100      /* 日志最大行数 */
 
 /* 路径配置 */
-#define RATHOLE_BIN_PATH            "/home/root/6677/rathole"
-#define RATHOLE_CONFIG_PATH         "/home/root/6677/client.toml"
+#define RATHOLE_BIN_PATH            "./rathole"
+#define RATHOLE_CONFIG_PATH         "./client.toml"
 #define RATHOLE_LOG_PATH            "/tmp/rathole.log"
 #define RATHOLE_PID_PATH            "/tmp/rathole.pid"
 

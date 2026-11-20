@@ -1,6 +1,6 @@
 /**
  * @file usb_mode.h
- * @brief USB模式切换头文件
+ * @brief USB模式切换头文件 (适配 RM500U-CN /mnt/data/usbenum.ini)
  */
 
 #ifndef USB_MODE_H
@@ -12,40 +12,27 @@
 extern "C" {
 #endif
 
-/* USB模式定义 */
+/* USB模式定义 (兼容前端 mode_value: 1=NCM, 2=ECM, 3=RNDIS, 4=MBIM) */
 #define USB_MODE_CDC_NCM  1
 #define USB_MODE_CDC_ECM  2
 #define USB_MODE_RNDIS    3
+#define USB_MODE_MBIM     4
 
-/* 配置文件路径 */
-#define USB_MODE_CFG_PATH     "/mnt/data/mode.cfg"
-#define USB_MODE_TMP_CFG_PATH "/mnt/data/mode_tmp.cfg"
-
-/* USB configfs 路径 */
-#define USB_GADGET_PATH       "/sys/kernel/config/usb_gadget/g1"
-#define USB_CONFIG_PATH       "/sys/kernel/config/usb_gadget/g1/configs/b.1"
-#define USB_FUNCTIONS_PATH    "/sys/kernel/config/usb_gadget/g1/functions"
-#define USB_UDC_PATH          "/sys/kernel/config/usb_gadget/g1/UDC"
-
-/* IPA 硬件加速路径 */
-#define PAMU3_PROTOCOL_PATH   "/sys/devices/platform/soc/soc:ipa/2b300000.pamu3/pamu3_protocol"
-
-/* USB 网络接口配置 */
-#define USB_INTERFACE_IP      "192.168.66.1"
-#define USB_INTERFACE_MAC     "CC:E8:AC:C0:00:00"
-#define DEFAULT_UDC           "29100000.dwc3"
+/* RM500U-CN USB 枚举配置文件 */
+#define USBENUM_INI_PATH  "/mnt/data/usbenum.ini"
+#define USB_CONFIG_F1     "/sys/kernel/config/usb_gadget/g1/configs/b.1/f1"
 
 /**
  * @brief 设置USB模式
- * @param mode 模式值 (1=CDC-NCM, 2=CDC-ECM, 3=RNDIS)
- * @param permanent 是否永久保存 (1=永久, 0=临时)
+ * @param mode 模式值 (1=CDC-NCM, 2=CDC-ECM, 3=RNDIS, 4=MBIM)
+ * @param permanent 保留参数 (写入 usbenum.ini 重启后生效)
  * @return 0成功, -1失败
  */
 int usb_mode_set(int mode, int permanent);
 
 /**
  * @brief 获取当前USB模式
- * @return 模式值 (1=CDC-NCM, 2=CDC-ECM, 3=RNDIS), -1表示未设置
+ * @return 模式值 (1=CDC-NCM, 2=CDC-ECM, 3=RNDIS, 4=MBIM), -1表示未设置
  */
 int usb_mode_get(void);
 
@@ -55,13 +42,6 @@ int usb_mode_get(void);
  * @return 模式名称字符串
  */
 const char* usb_mode_name(int mode);
-
-/**
- * @brief USB模式热切换（立即生效，无需重启）
- * @param mode 模式值 (1=CDC-NCM, 2=CDC-ECM, 3=RNDIS)
- * @return 0成功, 负数失败
- */
-int usb_mode_switch_advanced(int mode);
 
 /**
  * @brief 获取当前硬件USB模式（从configfs读取）

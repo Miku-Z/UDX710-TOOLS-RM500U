@@ -5,7 +5,10 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
+#include <ctype.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <gio/gio.h>
 #include "sms.h"
@@ -16,9 +19,25 @@
 static pthread_mutex_t g_sms_mutex = PTHREAD_MUTEX_INITIALIZER;
 static GDBusConnection *g_sms_dbus_conn = NULL;
 static guint g_signal_subscription_id = 0;
+static guint g_state_subscription_id = 0;
 static guint g_name_watch_id = 0;
 static int g_sms_initialized = 0;
 static int g_ofono_available = 0;
+static pthread_t g_sms_worker_thread;
+static volatile int g_sms_worker_running = 0;
+static time_t g_last_ims_check = 0;
+static int g_ims_registered = 0;
+
+/* 发送状态追踪（真实捕获 oFono MessageState 的 Sent/Failed） */
+#define MAX_PENDING_SENT 16
+typedef struct {
+    char uuid[128];
+    int db_id;
+    volatile int state; /* 0=pending, 1=sent, -1=failed */
+} PendingSentSms;
+static PendingSentSms g_pending_sent[MAX_PENDING_SENT];
+static int g_pending_sent_idx = 0;
+static pthread_mutex_t g_pending_sent_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Webhook配置 */
 static WebhookConfig g_webhook_config = {0};
@@ -43,6 +62,9 @@ static void add_webhook_log(const char *sender, const char *request, const char 
 static void on_incoming_message(GDBusConnection *conn, const gchar *sender_name,
     const gchar *object_path, const gchar *interface_name, const gchar *signal_name,
     GVariant *parameters, gpointer user_data);
+static void on_message_state(GDBusConnection *conn, const gchar *sender_name,
+    const gchar *object_path, const gchar *interface_name, const gchar *signal_name,
+    GVariant *parameters, gpointer user_data);
 static int save_sms_to_db(const char *sender, const char *content, time_t timestamp);
 static int save_sent_sms_to_db(const char *recipient, const char *content, time_t timestamp, const char *status);
 static void send_webhook_notification(const SmsMessage *msg);
@@ -52,6 +74,11 @@ static void unsubscribe_sms_signal(void);
 static void on_ofono_appeared(GDBusConnection *conn, const gchar *name, const gchar *name_owner, gpointer user_data);
 static void on_ofono_vanished(GDBusConnection *conn, const gchar *name, gpointer user_data);
 static void apply_sms_fix_on_init(void);
+static void ensure_sms_direct_route(void);
+static void ensure_ims_registered(int force);
+static void sms_drain_me_storage(void);
+static void *sms_worker_loop(void *arg);
+static void handle_incoming_sms_common(const char *sender, const char *content, time_t now);
 
 /* Hex解码函数 - 将hex字符串解码为原始字节 */
 static void hex_decode(const char *hex, char *out, size_t out_size) {
@@ -72,10 +99,23 @@ static void hex_decode(const char *hex, char *out, size_t out_size) {
 
 /* 保存短信到数据库 */
 static int save_sms_to_db(const char *sender, const char *content, time_t timestamp) {
-    char sql[2048];
-    char escaped_content[1024];
+    char sql[4096];
+    char escaped_sender[128];
+    char escaped_content[3072];
     
-    /* 转义单引号 */
+    /* 转义发件人单引号 */
+    size_t sj = 0;
+    for (size_t i = 0; sender[i] && sj < sizeof(escaped_sender) - 2; i++) {
+        if (sender[i] == '\'') {
+            escaped_sender[sj++] = '\'';
+            escaped_sender[sj++] = '\'';
+        } else {
+            escaped_sender[sj++] = sender[i];
+        }
+    }
+    escaped_sender[sj] = '\0';
+
+    /* 转义内容单引号 */
     size_t j = 0;
     for (size_t i = 0; content[i] && j < sizeof(escaped_content) - 2; i++) {
         if (content[i] == '\'') {
@@ -89,7 +129,7 @@ static int save_sms_to_db(const char *sender, const char *content, time_t timest
     
     snprintf(sql, sizeof(sql),
         "INSERT INTO sms (sender, content, timestamp, is_read) VALUES ('%s', '%s', %ld, 0);",
-        sender, escaped_content, (long)timestamp);
+        escaped_sender, escaped_content, (long)timestamp);
     
     pthread_mutex_lock(&g_sms_mutex);
     int ret = db_execute(sql);
@@ -154,8 +194,20 @@ static void subscribe_sms_signal(void) {
         on_incoming_message,
         NULL, NULL
     );
+
+    /* 订阅发送状态信号 (MessageState: Sent / Failed) */
+    g_state_subscription_id = g_dbus_connection_signal_subscribe(
+        g_sms_dbus_conn,
+        "org.ofono",
+        "org.ofono.MessageManager",
+        "MessageState",
+        NULL, NULL,
+        G_DBUS_SIGNAL_FLAGS_NONE,
+        on_message_state,
+        NULL, NULL
+    );
     
-    printf("[SMS] 短信信号订阅ID: %u\n", g_signal_subscription_id);
+    printf("[SMS] 短信信号订阅ID: %u, 状态订阅ID: %u\n", g_signal_subscription_id, g_state_subscription_id);
 }
 
 /* 取消短信信号订阅 */
@@ -164,7 +216,11 @@ static void unsubscribe_sms_signal(void) {
         g_dbus_connection_signal_unsubscribe(g_sms_dbus_conn, g_signal_subscription_id);
         printf("[SMS] 已取消信号订阅ID: %u\n", g_signal_subscription_id);
     }
+    if (g_state_subscription_id > 0 && g_sms_dbus_conn) {
+        g_dbus_connection_signal_unsubscribe(g_sms_dbus_conn, g_state_subscription_id);
+    }
     g_signal_subscription_id = 0;
+    g_state_subscription_id = 0;
 }
 
 /* oFono服务出现回调 */
@@ -175,7 +231,7 @@ static void on_ofono_appeared(GDBusConnection *conn, const gchar *name,
     printf("[SMS] oFono服务已启动: %s (owner: %s)\n", name, name_owner);
     g_ofono_available = 1;
     
-    /* 重新订阅短信信号 */
+    /* 重新订阅短信信号，后台线程统一维护 ME 存储与 IMS 注册 */
     subscribe_sms_signal();
 }
 
@@ -200,9 +256,119 @@ static void on_dbus_connection_closed(GDBusConnection *conn, gboolean remote_pee
     
     /* 清理状态 */
     g_signal_subscription_id = 0;
+    g_state_subscription_id = 0;
     g_name_watch_id = 0;
     g_ofono_available = 0;
     g_sms_dbus_conn = NULL;
+}
+
+/* 统一入库与 5 秒去重（兼容 oFono D-Bus 推送与 ME 存储排空双通道） */
+static void handle_incoming_sms_common(const char *sender, const char *content, time_t now) {
+    static pthread_mutex_t dedup_lock = PTHREAD_MUTEX_INITIALIZER;
+    static char last_sender[64] = {0};
+    static char last_content[2048] = {0};
+    static time_t last_ts = 0;
+
+    if (!sender || !content || content[0] == '\0') return;
+
+    pthread_mutex_lock(&dedup_lock);
+    if (last_ts > 0 && (now - last_ts) >= 0 && (now - last_ts) <= 5 &&
+        strcmp(last_sender, sender) == 0 &&
+        strncmp(last_content, content, sizeof(last_content) - 1) == 0) {
+        pthread_mutex_unlock(&dedup_lock);
+        return;
+    }
+    strncpy(last_sender, sender, sizeof(last_sender) - 1);
+    last_sender[sizeof(last_sender) - 1] = '\0';
+    strncpy(last_content, content, sizeof(last_content) - 1);
+    last_content[sizeof(last_content) - 1] = '\0';
+    last_ts = now;
+    pthread_mutex_unlock(&dedup_lock);
+
+    printf("[SMS] 新短信入库 - 发件人: %s, 内容: %s\n", sender, content);
+
+    if (save_sms_to_db(sender, content, now) == 0) {
+        printf("[SMS] 短信已保存到系统数据库\n");
+
+        if (g_webhook_config.enabled && strlen(g_webhook_config.url) > 0) {
+            SmsMessage msg = {0};
+            strncpy(msg.sender, sender, sizeof(msg.sender) - 1);
+            strncpy(msg.content, content, sizeof(msg.content) - 1);
+            msg.timestamp = now;
+            send_webhook_notification(&msg);
+        }
+    }
+}
+
+/* D-Bus信号处理 - 真实捕获短信发送结果 (MessageState: Sent / Failed) */
+static void on_message_state(GDBusConnection *conn, const gchar *sender_name,
+    const gchar *object_path, const gchar *interface_name, const gchar *signal_name,
+    GVariant *parameters, gpointer user_data) {
+    (void)conn; (void)sender_name; (void)object_path;
+    (void)interface_name; (void)signal_name; (void)user_data;
+
+    if (!parameters || !g_variant_is_of_type(parameters, G_VARIANT_TYPE("(oa{sv})"))) {
+        return;
+    }
+
+    const gchar *msg_path = NULL;
+    GVariant *props = NULL;
+    g_variant_get(parameters, "(&o@a{sv})", &msg_path, &props);
+    if (!props) return;
+
+    char uuid[128] = {0};
+    char status[32] = {0};
+
+    GVariant *v_uuid = g_variant_lookup_value(props, "UUID", G_VARIANT_TYPE_STRING);
+    if (v_uuid) {
+        const gchar *u = g_variant_get_string(v_uuid, NULL);
+        if (u) snprintf(uuid, sizeof(uuid), "%s", u);
+        g_variant_unref(v_uuid);
+    } else if (msg_path) {
+        const char *m = strstr(msg_path, "message_");
+        if (m) snprintf(uuid, sizeof(uuid), "%s", m + 8);
+    }
+
+    GVariant *v_st = g_variant_lookup_value(props, "Status", G_VARIANT_TYPE_STRING);
+    if (v_st) {
+        const gchar *s = g_variant_get_string(v_st, NULL);
+        if (s) snprintf(status, sizeof(status), "%s", s);
+        g_variant_unref(v_st);
+    }
+    g_variant_unref(props);
+
+    if (uuid[0] == '\0' || status[0] == '\0') return;
+
+    int new_state = 0;
+    const char *db_status = NULL;
+    if (strcasecmp(status, "Sent") == 0) {
+        new_state = 1;
+        db_status = "sent";
+    } else if (strcasecmp(status, "Failed") == 0 || strcasecmp(status, "Error") == 0) {
+        new_state = -1;
+        db_status = "failed";
+    } else {
+        return;
+    }
+
+    int target_db_id = -1;
+    pthread_mutex_lock(&g_pending_sent_mutex);
+    for (int i = 0; i < MAX_PENDING_SENT; i++) {
+        if (g_pending_sent[i].uuid[0] != '\0' && strcmp(g_pending_sent[i].uuid, uuid) == 0) {
+            g_pending_sent[i].state = new_state;
+            target_db_id = g_pending_sent[i].db_id;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_pending_sent_mutex);
+
+    if (target_db_id > 0 && db_status) {
+        char sql[128];
+        snprintf(sql, sizeof(sql), "UPDATE sent_sms SET status = '%s' WHERE id = %d;", db_status, target_db_id);
+        pthread_mutex_lock(&g_sms_mutex);
+        db_execute(sql);
+        pthread_mutex_unlock(&g_sms_mutex);
+    }
 }
 
 /* D-Bus信号处理 - 接收新短信 */
@@ -239,22 +405,7 @@ static void on_incoming_message(GDBusConnection *conn, const gchar *sender_name,
         g_variant_unref(sender_var);
     }
     
-    printf("[SMS] 新短信 - 发件人: %s, 内容: %s\n", sender, content);
-    
-    /* 保存到数据库 */
-    time_t now = time(NULL);
-    if (save_sms_to_db(sender, content, now) == 0) {
-        printf("[SMS] 短信已保存到数据库\n");
-        
-        /* 发送Webhook通知 */
-        if (g_webhook_config.enabled && strlen(g_webhook_config.url) > 0) {
-            SmsMessage msg = {0};
-            strncpy(msg.sender, sender, sizeof(msg.sender) - 1);
-            strncpy(msg.content, content, sizeof(msg.content) - 1);
-            msg.timestamp = now;
-            send_webhook_notification(&msg);
-        }
-    }
+    handle_incoming_sms_common(sender, content, time(NULL));
     g_variant_unref(props);
 }
 
@@ -439,6 +590,12 @@ int sms_init(const char *db_path) {
     /* 立即尝试订阅信号（如果oFono已经运行） */
     subscribe_sms_signal();
     g_ofono_available = 1;  /* 假设oFono可用，后续会通过监控更新 */
+
+    /* 启动后台轻量轮询线程：冷启动补齐 IMS 注册(AT+IMSEN=1) + ME 短信排空入库 */
+    g_sms_worker_running = 1;
+    if (pthread_create(&g_sms_worker_thread, NULL, sms_worker_loop, NULL) != 0) {
+        g_sms_worker_running = 0;
+    }
     
     printf("[SMS] 短信模块初始化成功\n");
     g_sms_initialized = 1;
@@ -448,6 +605,11 @@ int sms_init(const char *db_path) {
 /* 关闭短信模块 */
 void sms_deinit(void) {
     if (!g_sms_initialized) return;
+
+    if (g_sms_worker_running) {
+        g_sms_worker_running = 0;
+        pthread_join(g_sms_worker_thread, NULL);
+    }
     
     /* 取消信号订阅 */
     unsubscribe_sms_signal();
@@ -483,6 +645,14 @@ int sms_send(const char *recipient, const char *content, char *result_path, size
         printf("[SMS] D-Bus未连接或oFono服务不可用\n");
         return -1;
     }
+
+    /* 5G SA 场景下发短信前若 IMS 尚未注册，立刻补发 AT+IMSEN=1 并短暂等待注册生效 */
+    if (!g_ims_registered) {
+        ensure_ims_registered(1);
+        if (g_ims_registered) {
+            usleep(300000);
+        }
+    }
     
     printf("[SMS] 发送短信到 %s: %s\n", recipient, content);
     
@@ -504,23 +674,56 @@ int sms_send(const char *recipient, const char *content, char *result_path, size
     if (!result) {
         printf("[SMS] 发送短信失败: %s\n", error ? error->message : "未知错误");
         if (error) g_error_free(error);
+        save_sent_sms_to_db(recipient, content, time(NULL), "failed");
         return -1;
     }
     
-    /* 获取返回的消息路径 */
+    /* 获取返回的消息路径与 UUID */
     const gchar *path = NULL;
     g_variant_get(result, "(&o)", &path);
     
-    if (result_path && path_size > 0 && path) {
-        strncpy(result_path, path, path_size - 1);
-        result_path[path_size - 1] = '\0';
+    char path_copy[256] = {0};
+    if (path) {
+        snprintf(path_copy, sizeof(path_copy), "%s", path);
+        if (result_path && path_size > 0) {
+            snprintf(result_path, path_size, "%s", path);
+        }
     }
     
-    printf("[SMS] 短信发送成功，路径: %s\n", path ? path : "N/A");
+    printf("[SMS] 短信已提交至基带，路径: %s\n", path_copy[0] ? path_copy : "N/A");
     g_variant_unref(result);
-    
-    /* 保存发送记录到数据库 */
-    save_sent_sms_to_db(recipient, content, time(NULL), "sent");
+
+    /* 先记录为 pending，并等待最多 3 秒获取 oFono MessageState 真实送达/失败状态 */
+    int db_id = save_sent_sms_to_db(recipient, content, time(NULL), "pending");
+    const char *uuid_ptr = strstr(path_copy, "message_");
+    int slot = -1;
+    if (uuid_ptr && uuid_ptr[8] != '\0') {
+        pthread_mutex_lock(&g_pending_sent_mutex);
+        slot = g_pending_sent_idx % MAX_PENDING_SENT;
+        g_pending_sent_idx++;
+        snprintf(g_pending_sent[slot].uuid, sizeof(g_pending_sent[slot].uuid), "%s", uuid_ptr + 8);
+        g_pending_sent[slot].db_id = db_id;
+        g_pending_sent[slot].state = 0;
+        pthread_mutex_unlock(&g_pending_sent_mutex);
+
+        GMainContext *ctx = g_main_context_default();
+        for (int i = 0; i < 30; i++) {
+            while (g_main_context_pending(ctx)) {
+                g_main_context_iteration(ctx, FALSE);
+            }
+            int st = 0;
+            pthread_mutex_lock(&g_pending_sent_mutex);
+            st = g_pending_sent[slot].state;
+            pthread_mutex_unlock(&g_pending_sent_mutex);
+            if (st == 1) {
+                return 0; /* 运营商真实返回 Sent */
+            }
+            if (st == -1) {
+                return -1; /* 运营商真实返回 Failed */
+            }
+            usleep(100000);
+        }
+    }
     
     return 0;
 }
@@ -791,12 +994,574 @@ void sms_maintenance(void) {
         printf("[SMS] 检测到信号订阅丢失，重新订阅...\n");
         subscribe_sms_signal();
     }
+
+    /* 后台线程持续负责 IMS 保活与 ME 短信排空，此处仅做兜底检查 */
+    if (!g_sms_worker_running) {
+        ensure_sms_direct_route();
+    }
 }
 
-/* 获取短信接收修复开关状态 */
+/* ==================== 3GPP TS 23.040 SMS-DELIVER PDU 解码与长短信重组 ==================== */
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out) {
+    size_t n = 0;
+    while (hex[0] && hex[1] && n < max_out) {
+        int hi = hex_nibble(hex[0]);
+        int lo = hex_nibble(hex[1]);
+        if (hi < 0 || lo < 0) break;
+        out[n++] = (uint8_t)((hi << 4) | lo);
+        hex += 2;
+    }
+    return n;
+}
+
+static size_t utf8_append_cp(char *out, size_t pos, size_t max_out, uint32_t cp) {
+    if (cp < 0x80) {
+        if (pos + 1 < max_out) out[pos++] = (char)cp;
+    } else if (cp < 0x800) {
+        if (pos + 2 < max_out) {
+            out[pos++] = (char)(0xC0 | (cp >> 6));
+            out[pos++] = (char)(0x80 | (cp & 0x3F));
+        }
+    } else if (cp < 0x10000) {
+        if (pos + 3 < max_out) {
+            out[pos++] = (char)(0xE0 | (cp >> 12));
+            out[pos++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[pos++] = (char)(0x80 | (cp & 0x3F));
+        }
+    } else if (cp <= 0x10FFFF) {
+        if (pos + 4 < max_out) {
+            out[pos++] = (char)(0xF0 | (cp >> 18));
+            out[pos++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            out[pos++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[pos++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    return pos;
+}
+
+/* GSM 7-bit 基础字符表 (3GPP TS 23.038) */
+static const uint16_t k_gsm7_basic[128] = {
+    0x0040,0x00A3,0x0024,0x00A5,0x00E8,0x00E9,0x00F9,0x00EC,
+    0x00F2,0x00C7,0x000A,0x00D8,0x00F8,0x000D,0x00C5,0x00E5,
+    0x0394,0x005F,0x03A6,0x0393,0x039B,0x03A9,0x03A0,0x03A8,
+    0x03A3,0x0398,0x039E,0x001B,0x00C6,0x00E6,0x00DF,0x00C9,
+    0x0020,0x0021,0x0022,0x0023,0x00A4,0x0025,0x0026,0x0027,
+    0x0028,0x0029,0x002A,0x002B,0x002C,0x002D,0x002E,0x002F,
+    0x0030,0x0031,0x0032,0x0033,0x0034,0x0035,0x0036,0x0037,
+    0x0038,0x0039,0x003A,0x003B,0x003C,0x003D,0x003E,0x003F,
+    0x00A1,0x0041,0x0042,0x0043,0x0044,0x0045,0x0046,0x0047,
+    0x0048,0x0049,0x004A,0x004B,0x004C,0x004D,0x004E,0x004F,
+    0x0050,0x0051,0x0052,0x0053,0x0054,0x0055,0x0056,0x0057,
+    0x0058,0x0059,0x005A,0x00C4,0x00D6,0x00D1,0x00DC,0x00A7,
+    0x00BF,0x0061,0x0062,0x0063,0x0064,0x0065,0x0066,0x0067,
+    0x0068,0x0069,0x006A,0x006B,0x006C,0x006D,0x006E,0x006F,
+    0x0070,0x0071,0x0072,0x0073,0x0074,0x0075,0x0076,0x0077,
+    0x0078,0x0079,0x007A,0x00E4,0x00F6,0x00F1,0x00FC,0x00E0
+};
+
+static uint16_t gsm7_ext_cp(uint8_t c) {
+    switch (c) {
+        case 0x0A: return 0x000C;
+        case 0x14: return '^';
+        case 0x28: return '{';
+        case 0x29: return '}';
+        case 0x2F: return '\\';
+        case 0x3C: return '[';
+        case 0x3D: return '~';
+        case 0x3E: return ']';
+        case 0x40: return '|';
+        case 0x65: return 0x20AC; /* € */
+        default:   return ' ';
+    }
+}
+
+static void decode_gsm7(const uint8_t *data, size_t data_len, int start_septet, int total_septets,
+                        char *out, size_t max_out) {
+    size_t pos = 0;
+    int esc = 0;
+    for (int s = start_septet; s < total_septets; s++) {
+        int bit_off = s * 7;
+        size_t byte_idx = (size_t)(bit_off / 8);
+        int bit_idx = bit_off % 8;
+        if (byte_idx >= data_len) break;
+        uint16_t val = (uint16_t)(data[byte_idx] >> bit_idx);
+        if (bit_idx > 1 && byte_idx + 1 < data_len) {
+            val |= (uint16_t)(data[byte_idx + 1] << (8 - bit_idx));
+        }
+        uint8_t ch = (uint8_t)(val & 0x7F);
+        if (esc) {
+            pos = utf8_append_cp(out, pos, max_out, gsm7_ext_cp(ch));
+            esc = 0;
+        } else if (ch == 0x1B) {
+            esc = 1;
+        } else {
+            pos = utf8_append_cp(out, pos, max_out, k_gsm7_basic[ch]);
+        }
+    }
+    if (pos < max_out) out[pos] = '\0';
+    else if (max_out > 0) out[max_out - 1] = '\0';
+}
+
+static void decode_ucs2(const uint8_t *data, size_t data_len, char *out, size_t max_out) {
+    size_t pos = 0;
+    for (size_t i = 0; i + 1 < data_len; i += 2) {
+        uint32_t cp = ((uint32_t)data[i] << 8) | data[i + 1];
+        /* 处理 UTF-16 代理对 (Emoji 等 4 字节字符) */
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 3 < data_len) {
+            uint32_t lo = ((uint32_t)data[i + 2] << 8) | data[i + 3];
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                cp = 0x10000 + (((cp - 0xD800) << 10) | (lo - 0xDC00));
+                i += 2;
+            }
+        }
+        pos = utf8_append_cp(out, pos, max_out, cp);
+    }
+    if (pos < max_out) out[pos] = '\0';
+    else if (max_out > 0) out[max_out - 1] = '\0';
+}
+
+static int bcd_swap_dec(uint8_t b) {
+    int lo = b & 0x0F;
+    int hi = (b >> 4) & 0x0F;
+    if (lo > 9 || hi > 9) return 0;
+    return lo * 10 + hi;
+}
+
+typedef struct {
+    char sender[64];
+    char text[1024];
+    time_t timestamp;
+    uint16_t concat_ref;
+    uint8_t concat_total;
+    uint8_t concat_seq;
+} DecodedSmsPdu;
+
+static int decode_sms_deliver_pdu(const char *hex_pdu, DecodedSmsPdu *out) {
+    if (!hex_pdu || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    out->timestamp = time(NULL);
+
+    uint8_t pdu[300];
+    size_t pdu_len = hex_to_bytes(hex_pdu, pdu, sizeof(pdu));
+    if (pdu_len < 12) return -1;
+
+    size_t pos = 0;
+    /* 1. 跳过 SMSC 中心号码 */
+    uint8_t smsc_len = pdu[pos++];
+    if (pos + smsc_len >= pdu_len) return -1;
+    pos += smsc_len;
+
+    /* 2. PDU-Type (MTI=0 为 SMS-DELIVER) */
+    uint8_t pdu_type = pdu[pos++];
+    if ((pdu_type & 0x03) != 0x00) return -1;
+    int has_udh = (pdu_type & 0x40) != 0;
+
+    /* 3. 发件人地址 OA */
+    if (pos + 2 > pdu_len) return -1;
+    uint8_t oa_digits = pdu[pos++];
+    uint8_t oa_type = pdu[pos++];
+    size_t oa_bytes = (size_t)((oa_digits + 1) / 2);
+    if (pos + oa_bytes > pdu_len) return -1;
+
+    if ((oa_type & 0x70) == 0x50) {
+        /* 字母数字发件人 (GSM 7-bit) */
+        int septets = (oa_digits * 4) / 7;
+        decode_gsm7(pdu + pos, oa_bytes, 0, septets, out->sender, sizeof(out->sender));
+    } else {
+        size_t sp = 0;
+        if ((oa_type & 0x70) == 0x10 && sp + 1 < sizeof(out->sender)) {
+            out->sender[sp++] = '+';
+        }
+        static const char k_bcd_map[16] = "0123456789*#abc";
+        for (size_t i = 0; i < oa_bytes && sp + 2 < sizeof(out->sender); i++) {
+            uint8_t lo = pdu[pos + i] & 0x0F;
+            uint8_t hi = (pdu[pos + i] >> 4) & 0x0F;
+            if (lo < 15) out->sender[sp++] = k_bcd_map[lo];
+            if (hi < 15) out->sender[sp++] = k_bcd_map[hi];
+        }
+        out->sender[sp] = '\0';
+    }
+    if (out->sender[0] == '\0') snprintf(out->sender, sizeof(out->sender), "未知");
+    pos += oa_bytes;
+
+    /* 4. PID & DCS */
+    if (pos + 2 + 7 + 1 > pdu_len) return -1;
+    pos++; /* PID */
+    uint8_t dcs = pdu[pos++];
+
+    int coding = 0; /* 0=GSM7, 1=8bit, 2=UCS2 */
+    if ((dcs & 0xC0) == 0x00 || (dcs & 0xF0) == 0xF0) {
+        int alpha = (dcs >> 2) & 0x03;
+        if (alpha == 1) coding = 1;
+        else if (alpha == 2) coding = 2;
+    } else if ((dcs & 0xF0) == 0xE0) {
+        coding = 2;
+    }
+
+    /* 5. SCTS 7 字节时间戳 */
+    struct tm tmv;
+    memset(&tmv, 0, sizeof(tmv));
+    tmv.tm_year = 2000 + bcd_swap_dec(pdu[pos]) - 1900;
+    tmv.tm_mon  = bcd_swap_dec(pdu[pos + 1]) - 1;
+    tmv.tm_mday = bcd_swap_dec(pdu[pos + 2]);
+    tmv.tm_hour = bcd_swap_dec(pdu[pos + 3]);
+    tmv.tm_min  = bcd_swap_dec(pdu[pos + 4]);
+    tmv.tm_sec  = bcd_swap_dec(pdu[pos + 5]);
+    tmv.tm_isdst = -1;
+    pos += 7;
+    if (tmv.tm_mon >= 0 && tmv.tm_mon <= 11 && tmv.tm_mday >= 1 && tmv.tm_mday <= 31) {
+        time_t parsed_ts = mktime(&tmv);
+        if (parsed_ts > 1600000000) out->timestamp = parsed_ts;
+    }
+
+    /* 6. UDL & UD (含可选 UDH 长短信分片头) */
+    uint8_t udl = pdu[pos++];
+    const uint8_t *ud = pdu + pos;
+    size_t ud_avail = pdu_len - pos;
+
+    size_t udh_total_bytes = 0;
+    if (has_udh && ud_avail >= 1) {
+        uint8_t udhl = ud[0];
+        if ((size_t)(1 + udhl) <= ud_avail) {
+            udh_total_bytes = (size_t)(1 + udhl);
+            size_t ipos = 1;
+            while (ipos + 2 <= udh_total_bytes) {
+                uint8_t iei = ud[ipos];
+                uint8_t iel = ud[ipos + 1];
+                if (ipos + 2 + iel > udh_total_bytes) break;
+                if (iei == 0x00 && iel == 3) {
+                    out->concat_ref   = ud[ipos + 2];
+                    out->concat_total = ud[ipos + 3];
+                    out->concat_seq   = ud[ipos + 4];
+                } else if (iei == 0x08 && iel == 4) {
+                    out->concat_ref   = (uint16_t)((ud[ipos + 2] << 8) | ud[ipos + 3]);
+                    out->concat_total = ud[ipos + 4];
+                    out->concat_seq   = ud[ipos + 5];
+                }
+                ipos += 2 + iel;
+            }
+        }
+    }
+
+    if (coding == 2) {
+        size_t body_len = (udl > udh_total_bytes) ? (size_t)(udl - udh_total_bytes) : 0;
+        if (udh_total_bytes + body_len > ud_avail) {
+            body_len = (ud_avail > udh_total_bytes) ? (ud_avail - udh_total_bytes) : 0;
+        }
+        decode_ucs2(ud + udh_total_bytes, body_len, out->text, sizeof(out->text));
+    } else if (coding == 1) {
+        size_t body_len = (udl > udh_total_bytes) ? (size_t)(udl - udh_total_bytes) : 0;
+        if (udh_total_bytes + body_len > ud_avail) {
+            body_len = (ud_avail > udh_total_bytes) ? (ud_avail - udh_total_bytes) : 0;
+        }
+        if (body_len >= sizeof(out->text)) body_len = sizeof(out->text) - 1;
+        memcpy(out->text, ud + udh_total_bytes, body_len);
+        out->text[body_len] = '\0';
+    } else {
+        int skip_septets = (udh_total_bytes > 0) ? (int)((udh_total_bytes * 8 + 6) / 7) : 0;
+        decode_gsm7(ud, ud_avail, skip_septets, (int)udl, out->text, sizeof(out->text));
+    }
+
+    return 0;
+}
+
+/* 长短信分片重组缓存 */
+#define MAX_CONCAT_GROUPS 8
+#define MAX_CONCAT_PARTS  12
+typedef struct {
+    int in_use;
+    char sender[64];
+    uint16_t ref;
+    uint8_t total;
+    uint8_t received_mask_count;
+    time_t timestamp;
+    time_t last_update;
+    int has_part[MAX_CONCAT_PARTS];
+    char parts[MAX_CONCAT_PARTS][512];
+} SmsConcatGroup;
+
+static SmsConcatGroup g_concat_groups[MAX_CONCAT_GROUPS];
+static pthread_mutex_t g_concat_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void flush_concat_group_locked(SmsConcatGroup *g) {
+    char combined[2048] = {0};
+    size_t pos = 0;
+    for (int i = 0; i < g->total && i < MAX_CONCAT_PARTS; i++) {
+        if (g->has_part[i]) {
+            size_t len = strlen(g->parts[i]);
+            if (pos + len >= sizeof(combined) - 1) len = sizeof(combined) - 1 - pos;
+            memcpy(combined + pos, g->parts[i], len);
+            pos += len;
+        }
+    }
+    combined[pos] = '\0';
+    char sender_copy[64];
+    snprintf(sender_copy, sizeof(sender_copy), "%s", g->sender);
+    time_t ts = g->timestamp;
+    memset(g, 0, sizeof(*g));
+    if (combined[0] != '\0') {
+        handle_incoming_sms_common(sender_copy, combined, ts);
+    }
+}
+
+static void submit_decoded_sms_part(const DecodedSmsPdu *msg) {
+    if (!msg || msg->text[0] == '\0') return;
+    if (msg->concat_total <= 1 || msg->concat_total > MAX_CONCAT_PARTS ||
+        msg->concat_seq < 1 || msg->concat_seq > msg->concat_total) {
+        handle_incoming_sms_common(msg->sender, msg->text, msg->timestamp);
+        return;
+    }
+
+    pthread_mutex_lock(&g_concat_mutex);
+    int idx = -1;
+    int free_idx = -1;
+    for (int i = 0; i < MAX_CONCAT_GROUPS; i++) {
+        if (g_concat_groups[i].in_use) {
+            if (g_concat_groups[i].ref == msg->concat_ref &&
+                g_concat_groups[i].total == msg->concat_total &&
+                strcmp(g_concat_groups[i].sender, msg->sender) == 0) {
+                idx = i;
+                break;
+            }
+        } else if (free_idx < 0) {
+            free_idx = i;
+        }
+    }
+    if (idx < 0) {
+        idx = (free_idx >= 0) ? free_idx : 0;
+        if (g_concat_groups[idx].in_use) {
+            flush_concat_group_locked(&g_concat_groups[idx]);
+        }
+        memset(&g_concat_groups[idx], 0, sizeof(g_concat_groups[idx]));
+        g_concat_groups[idx].in_use = 1;
+        snprintf(g_concat_groups[idx].sender, sizeof(g_concat_groups[idx].sender), "%s", msg->sender);
+        g_concat_groups[idx].ref = msg->concat_ref;
+        g_concat_groups[idx].total = msg->concat_total;
+        g_concat_groups[idx].timestamp = msg->timestamp;
+    }
+
+    SmsConcatGroup *g = &g_concat_groups[idx];
+    int part_idx = msg->concat_seq - 1;
+    if (!g->has_part[part_idx]) {
+        g->has_part[part_idx] = 1;
+        g->received_mask_count++;
+    }
+    snprintf(g->parts[part_idx], sizeof(g->parts[part_idx]), "%s", msg->text);
+    g->last_update = time(NULL);
+
+    if (g->received_mask_count >= g->total) {
+        flush_concat_group_locked(g);
+    }
+    pthread_mutex_unlock(&g_concat_mutex);
+}
+
+static void flush_expired_concat_groups(void) {
+    time_t now = time(NULL);
+    pthread_mutex_lock(&g_concat_mutex);
+    for (int i = 0; i < MAX_CONCAT_GROUPS; i++) {
+        if (g_concat_groups[i].in_use && (now - g_concat_groups[i].last_update) >= 25) {
+            flush_concat_group_locked(&g_concat_groups[i]);
+        }
+    }
+    pthread_mutex_unlock(&g_concat_mutex);
+}
+
+/* ==================== 5G SA IMS 自动注册保活 (AT+IMSEN=1) ==================== */
+
+static void ensure_ims_registered(int force) {
+    extern int execute_at(const char *command, char **result);
+    time_t now = time(NULL);
+    if (!force && g_last_ims_check > 0 && (now - g_last_ims_check) < 30) {
+        return;
+    }
+    g_last_ims_check = now;
+
+    char *res = NULL;
+    if (execute_at("AT+CIREG?", &res) != 0 || !res) {
+        return;
+    }
+
+    int registered = (strstr(res, "+CIREG:2,1") != NULL ||
+                      strstr(res, "+CIREG: 2,1") != NULL ||
+                      strstr(res, "+CIREG:1,1") != NULL ||
+                      strstr(res, "+CIREG: 1,1") != NULL);
+    g_free(res);
+    res = NULL;
+
+    if (registered) {
+        g_ims_registered = 1;
+        return;
+    }
+
+    g_ims_registered = 0;
+    /* 严禁调用 org.ofono.IpMultimediaSystem.Register (会崩 ofonod)；直接下发基带标准 IMS 启动命令 */
+    if (execute_at("AT+CAVIMS=1", &res) == 0 && res) { g_free(res); res = NULL; }
+    if (execute_at("AT+CASIMS=1", &res) == 0 && res) { g_free(res); res = NULL; }
+    if (execute_at("AT+IMSEN=1", &res) == 0 && res)  { g_free(res); res = NULL; }
+
+    /* 短暂复查注册结果 */
+    usleep(500000);
+    if (execute_at("AT+CIREG?", &res) == 0 && res) {
+        if (strstr(res, "+CIREG:2,1") != NULL || strstr(res, "+CIREG: 2,1") != NULL ||
+            strstr(res, "+CIREG:1,1") != NULL || strstr(res, "+CIREG: 1,1") != NULL) {
+            g_ims_registered = 1;
+        }
+        g_free(res);
+    }
+}
+
+/* ==================== ME 暂存 -> 系统数据库排空入库 (零 SIM 卡写入) ==================== */
+
+/* 确保短信存储指向 ME 且 CNMI=2,1,0,0,0（实测 RM500U-CN 上 CNMI=3,2 会丢短信） */
+static void ensure_sms_direct_route(void) {
+    extern int execute_at(const char *command, char **result);
+    if (!sms_get_fix_enabled()) return;
+
+    char *res = NULL;
+    int need_cpms = 1;
+    if (execute_at("AT+CPMS?", &res) == 0 && res) {
+        if (strstr(res, "+CPMS: \"ME\"") != NULL || strstr(res, "+CPMS:\"ME\"") != NULL) {
+            need_cpms = 0;
+        }
+        g_free(res);
+        res = NULL;
+    }
+    if (need_cpms) {
+        if (execute_at("AT+CPMS=\"ME\",\"ME\",\"ME\"", &res) == 0 && res) {
+            g_free(res);
+            res = NULL;
+        }
+    }
+
+    int need_cnmi = 1;
+    if (execute_at("AT+CNMI?", &res) == 0 && res) {
+        if (strstr(res, "+CNMI: 2,1,0,0,0") != NULL || strstr(res, "+CNMI:2,1,0,0,0") != NULL) {
+            need_cnmi = 0;
+        }
+        g_free(res);
+        res = NULL;
+    }
+    if (need_cnmi) {
+        if (execute_at("AT+CSMS=0", &res) == 0 && res) { g_free(res); res = NULL; }
+        if (execute_at("AT+CNMI=2,1,0,0,0", &res) == 0 && res) { g_free(res); res = NULL; }
+    }
+}
+
+static void sms_drain_me_storage(void) {
+    extern int execute_at(const char *command, char **result);
+    if (!sms_get_fix_enabled()) return;
+
+    char *res = NULL;
+    if (execute_at("AT+CPMS?", &res) != 0 || !res) {
+        return;
+    }
+
+    int is_me = (strstr(res, "+CPMS: \"ME\"") != NULL || strstr(res, "+CPMS:\"ME\"") != NULL);
+    int used = 0, total = 0;
+    const char *p = strstr(res, "+CPMS:");
+    if (p) {
+        p += 6;
+        while (*p == ' ' || *p == '\t') p++;
+        char m1[16] = {0};
+        if (sscanf(p, "\"%15[^\"]\",%d,%d", m1, &used, &total) == 3) {
+            is_me = (strcmp(m1, "ME") == 0);
+        }
+    }
+    g_free(res);
+    res = NULL;
+
+    if (!is_me) {
+        ensure_sms_direct_route();
+        return;
+    }
+
+    if (used <= 0) {
+        flush_expired_concat_groups();
+        return;
+    }
+
+    if (total <= 0 || total > 120) total = 100;
+    int found = 0;
+
+    for (int idx = 1; idx <= total && found < used && g_sms_worker_running; idx++) {
+        char cmd[32];
+        snprintf(cmd, sizeof(cmd), "AT+CMGR=%d", idx);
+        if (execute_at(cmd, &res) != 0 || !res) {
+            continue;
+        }
+
+        const char *cmgr = strstr(res, "+CMGR:");
+        if (cmgr) {
+            found++;
+            /* 查找 +CMGR 行后的 PDU 十六进制行 */
+            const char *nl = strpbrk(cmgr, "\r\n");
+            if (nl) {
+                nl++;
+                while (*nl == '\r' || *nl == '\n' || *nl == ' ') nl++;
+                char pdu_hex[640] = {0};
+                size_t k = 0;
+                while (nl[k] && isxdigit((unsigned char)nl[k]) && k < sizeof(pdu_hex) - 1) {
+                    pdu_hex[k] = nl[k];
+                    k++;
+                }
+                pdu_hex[k] = '\0';
+
+                if (k >= 24) {
+                    DecodedSmsPdu decoded;
+                    if (decode_sms_deliver_pdu(pdu_hex, &decoded) == 0) {
+                        submit_decoded_sms_part(&decoded);
+                    }
+                }
+            }
+
+            /* 读取入库后立即从 ME 删除，保持 ME 0/100 永不写满 */
+            char del_cmd[32];
+            char *del_res = NULL;
+            snprintf(del_cmd, sizeof(del_cmd), "AT+CMGD=%d", idx);
+            if (execute_at(del_cmd, &del_res) == 0 && del_res) {
+                g_free(del_res);
+            }
+        }
+
+        g_free(res);
+        res = NULL;
+    }
+
+    flush_expired_concat_groups();
+}
+
+static void *sms_worker_loop(void *arg) {
+    (void)arg;
+    int first_run = 1;
+    while (g_sms_worker_running) {
+        if (g_ofono_available) {
+            if (first_run) {
+                ensure_sms_direct_route();
+                ensure_ims_registered(1);
+                first_run = 0;
+            } else {
+                ensure_ims_registered(0);
+            }
+            sms_drain_me_storage();
+        }
+        for (int i = 0; i < 40 && g_sms_worker_running; i++) {
+            usleep(100000); /* 4 秒周期，支持快速退出 */
+        }
+    }
+    return NULL;
+}
+
+/* 获取短信接收修复开关状态（RM500U-CN 强制启用 ME 暂存自动排空入系统 SQLite，不再暴露 R106 开关） */
 int sms_get_fix_enabled(void) {
-    const char *sql = "SELECT sms_fix_enabled FROM sms_config WHERE id = 1;";
-    return db_query_int(sql, 0);  /* 默认关闭 */
+    return 1;
 }
 
 /* 设置短信接收修复开关 */
@@ -805,18 +1570,18 @@ int sms_set_fix_enabled(int enabled) {
     char sql[256];
     char *at_result = NULL;
     
-    /* 发送AT命令 */
-    const char *at_cmd = enabled ? "AT+CNMI=3,2,0,1,0" : "AT+CNMI=3,1,0,1,0";
-    printf("[SMS] 发送AT命令: %s\n", at_cmd);
-    
-    if (execute_at(at_cmd, &at_result) != 0) {
-        printf("[SMS] AT命令执行失败\n");
+    /* 开启=切至 ME 存储 + CNMI=2,1,0,0,0 自动排空入数据库；关闭=回退 SM (SIM卡) */
+    const char *cpms_cmd = enabled ? "AT+CPMS=\"ME\",\"ME\",\"ME\"" : "AT+CPMS=\"SM\",\"SM\",\"SM\"";
+    if (execute_at(cpms_cmd, &at_result) != 0) {
         if (at_result) g_free(at_result);
         return -1;
     }
-    
-    printf("[SMS] AT命令执行成功: %s\n", at_result ? at_result : "OK");
-    if (at_result) g_free(at_result);
+    if (at_result) { g_free(at_result); at_result = NULL; }
+
+    if (execute_at("AT+CNMI=2,1,0,0,0", &at_result) == 0 && at_result) {
+        g_free(at_result);
+        at_result = NULL;
+    }
     
     /* 保存到数据库 */
     snprintf(sql, sizeof(sql),
@@ -833,29 +1598,15 @@ int sms_set_fix_enabled(int enabled) {
 
 /* 初始化时应用短信修复设置 */
 static void apply_sms_fix_on_init(void) {
-    extern int execute_at(const char *command, char **result);
-    
-    int enabled = sms_get_fix_enabled();
-    printf("[SMS] 短信接收修复开关状态: %s\n", enabled ? "开启" : "关闭");
-    
-    if (enabled) {
-        char *at_result = NULL;
-        printf("[SMS] 开机应用短信修复AT命令: AT+CNMI=3,2,0,1,0\n");
-        
-        if (execute_at("AT+CNMI=3,2,0,1,0", &at_result) == 0) {
-            printf("[SMS] AT命令执行成功\n");
-        } else {
-            printf("[SMS] AT命令执行失败\n");
-        }
-        
-        if (at_result) g_free(at_result);
+    if (sms_get_fix_enabled()) {
+        ensure_sms_direct_route();
     }
 }
 
-/* 保存发送记录到数据库 */
+/* 保存发送记录到数据库，返回新插入记录的 ID */
 static int save_sent_sms_to_db(const char *recipient, const char *content, time_t timestamp, const char *status) {
-    char sql[2048];
-    char escaped_content[1024];
+    char sql[4096];
+    char escaped_content[3072];
     
     size_t j = 0;
     for (size_t i = 0; content[i] && j < sizeof(escaped_content) - 2; i++) {
@@ -872,21 +1623,19 @@ static int save_sent_sms_to_db(const char *recipient, const char *content, time_
         "INSERT INTO sent_sms (recipient, content, timestamp, status) VALUES ('%s', '%s', %ld, '%s');",
         recipient, escaped_content, (long)timestamp, status);
     
+    int inserted_id = -1;
     pthread_mutex_lock(&g_sms_mutex);
     int ret = db_execute(sql);
-    pthread_mutex_unlock(&g_sms_mutex);
-    
-    /* 清理超出限制的旧发送记录 */
     if (ret == 0) {
+        inserted_id = db_query_int("SELECT MAX(id) FROM sent_sms;", -1);
         snprintf(sql, sizeof(sql),
             "DELETE FROM sent_sms WHERE id NOT IN (SELECT id FROM sent_sms ORDER BY id DESC LIMIT %d);",
             g_max_sent_count);
-        pthread_mutex_lock(&g_sms_mutex);
         db_execute(sql);
-        pthread_mutex_unlock(&g_sms_mutex);
     }
+    pthread_mutex_unlock(&g_sms_mutex);
     
-    return ret;
+    return inserted_id;
 }
 
 /* 删除发送记录 */

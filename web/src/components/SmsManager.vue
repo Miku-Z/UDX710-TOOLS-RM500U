@@ -22,8 +22,6 @@ const replyContent = ref('')
 const newSms = ref({ recipient: '', content: '' })
 const sendStatus = ref({ show: false, success: false, message: '' })
 const smsConfig = ref({ max_count: 50, max_sent_count: 10 })
-const smsFixEnabled = ref(false)
-const smsFixLoading = ref(false)
 const showSelectMode = ref(false)
 const showSentSelectMode = ref(false)
 const showTutorial = ref(false)
@@ -125,45 +123,9 @@ async function saveSmsConfigApi() {
   return res.json()
 }
 
-async function fetchSmsFixStatus() {
-  try {
-    const res = await authFetch('/api/sms/fix')
-    if (res.ok) {
-      const data = await res.json()
-      smsFixEnabled.value = data.enabled
-    }
-  } catch (e) { console.error('获取短信修复状态失败:', e) }
-}
-
-async function toggleSmsFix() {
-  smsFixLoading.value = true
-  const newValue = smsFixEnabled.value  // v-model 已经更新了值
-  console.log('[SMS Fix] 设置为:', newValue)
-  try {
-    const res = await authFetch('/api/sms/fix', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled: newValue })
-    })
-    const result = await res.json()
-    console.log('[SMS Fix] API返回:', result)
-    if (result.status === 'success') {
-      showStatus(true, result.message)
-    } else {
-      // 失败时回滚
-      smsFixEnabled.value = !newValue
-      showStatus(false, result.error || '设置失败')
-    }
-  } catch (e) { 
-    console.error('[SMS Fix] 错误:', e)
-    smsFixEnabled.value = !newValue  // 回滚
-    showStatus(false, '设置失败') 
-  }
-  finally { smsFixLoading.value = false }
-}
-
 let refreshTimer = null
 onMounted(() => {
-  fetchSmsList(); fetchSentList(); fetchWebhookConfig(); fetchSmsConfig(); fetchSmsFixStatus()
+  fetchSmsList(); fetchSentList(); fetchWebhookConfig(); fetchSmsConfig()
   refreshTimer = setInterval(() => { fetchSmsList(); fetchSentList() }, 10000)
 })
 onUnmounted(() => { if (refreshTimer) clearInterval(refreshTimer) })
@@ -172,7 +134,6 @@ onUnmounted(() => { if (refreshTimer) clearInterval(refreshTimer) })
 watch(activeTab, (newTab) => {
   if (newTab === 'config') {
     fetchSmsConfig()
-    fetchSmsFixStatus()
   } else if (newTab === 'forward') {
     fetchWebhookConfig()
   }
@@ -503,21 +464,6 @@ async function saveSmsConfig() {
           <div class="p-4 bg-slate-50 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/10">
             <p class="text-slate-600 dark:text-white/60 text-sm">{{ t('sms.currentOutbox') }}</p>
             <p class="text-2xl font-bold text-slate-900 dark:text-white mt-1">{{ sentMessages.length }} <span class="text-slate-400 dark:text-white/40 text-sm font-normal">/ {{ smsConfig.max_sent_count }}</span></p>
-          </div>
-        </div>
-        <div class="p-4 bg-slate-50 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/10">
-          <div class="flex items-center justify-between">
-            <div class="flex items-center space-x-3">
-              <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-amber-500/20 to-orange-500/20 flex items-center justify-center"><i class="fas fa-wrench text-amber-500 dark:text-amber-400"></i></div>
-              <div>
-                <p class="text-slate-900 dark:text-white font-medium">{{ t('sms.smsReceiveFix') }}</p>
-                <p class="text-slate-500 dark:text-white/40 text-xs">{{ t('sms.smsReceiveFixDesc') }}</p>
-              </div>
-            </div>
-                        <label class="relative inline-flex items-center cursor-pointer">
-              <input type="checkbox" v-model="smsFixEnabled" @change="toggleSmsFix" :disabled="smsFixLoading" class="sr-only peer" />
-              <div class="w-14 h-7 bg-slate-200 dark:bg-white/10 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:left-[4px] after:bg-white after:rounded-full after:h-6 after:w-6 after:transition-all peer-checked:bg-emerald-500"></div>
-            </label>
           </div>
         </div>
       </div>

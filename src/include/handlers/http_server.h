@@ -27,6 +27,11 @@ void http_server_stop(void);
  */
 void http_server_run(void);
 
+/**
+ * @brief 获取当前监听端口字符串
+ */
+const char *http_server_get_port(void);
+
 #ifdef __cplusplus
 }
 #endif

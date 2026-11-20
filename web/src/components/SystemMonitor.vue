@@ -1,7 +1,7 @@
 <script setup>
 import { inject, computed, ref, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { clearCache, getCurrentBand } from '../composables/useApi'
+import { clearCache, getCurrentBand, getNrRadioDetail } from '../composables/useApi'
 import { useToast } from '../composables/useToast'
 import { useConfirm } from '../composables/useConfirm'
 
@@ -27,19 +27,44 @@ function maskValue(value, showFull) {
 
 // 当前连接频段信息
 const currentBand = ref(null)
+const nrRadioDetail = ref(null)
 const bandLoading = ref(false)
+const nrLoading = ref(false)
+
+// 快速刷新 NR 无线参数（调制/MIMO/MCS）以捕获下行突发
+async function fetchNrRadioDetail() {
+  if (nrLoading.value) return
+  nrLoading.value = true
+  try {
+    const nrRes = await getNrRadioDetail()
+    if (nrRes && nrRes.Code === 0) {
+      nrRadioDetail.value = nrRes.Data
+    }
+  } catch (err) {
+    console.error('获取NR无线详情失败:', err)
+  }
+  nrLoading.value = false
+}
 
 // 获取当前频段信息
 async function fetchCurrentBand() {
   if (bandLoading.value) return // 防止重复请求
   bandLoading.value = true
   try {
-    const res = await getCurrentBand()
-    if (res && res.Code === 0 && res.Data) {
-      currentBand.value = res.Data
-    } else if (res && res.data) {
-      // 兼容不同的响应格式
-      currentBand.value = res.data
+    const [res, nrRes] = await Promise.allSettled([
+      getCurrentBand(),
+      getNrRadioDetail()
+    ])
+    if (res.status === 'fulfilled') {
+      const r = res.value
+      if (r && r.Code === 0 && r.Data) {
+        currentBand.value = r.Data
+      } else if (r && r.data) {
+        currentBand.value = r.data
+      }
+    }
+    if (nrRes.status === 'fulfilled' && nrRes.value && nrRes.value.Code === 0 && nrRes.value.Data) {
+      nrRadioDetail.value = nrRes.value.Data
     }
   } catch (err) {
     console.error('获取频段信息失败:', err)
@@ -47,16 +72,19 @@ async function fetchCurrentBand() {
   bandLoading.value = false
 }
 
-// 定时刷新频段信息
+// 定时刷新频段与 NR 无线参数
 let bandTimer = null
+let nrDetailTimer = null
 onMounted(async () => {
   await nextTick()
   fetchCurrentBand()
   bandTimer = setInterval(fetchCurrentBand, 10000)
+  nrDetailTimer = setInterval(fetchNrRadioDetail, 2500)
 })
 
 onUnmounted(() => {
   if (bandTimer) clearInterval(bandTimer)
+  if (nrDetailTimer) clearInterval(nrDetailTimer)
 })
 
 // 信号强度等级计算（返回1-4）
@@ -107,17 +135,17 @@ const uptime = computed(() => {
   return str
 })
 
-// 计算内存使用率
-const memoryPercent = computed(() => {
-  const total = systemInfo.value?.total_ram || 1
-  const free = systemInfo.value?.free_ram || 0
-  return Math.round(((total - free) / total) * 100)
-})
-
+// 计算内存使用率（扣除 cached_ram 可回收缓存，反映真实内存占用）
 const usedMemory = computed(() => {
   const total = systemInfo.value?.total_ram || 0
   const free = systemInfo.value?.free_ram || 0
-  return total - free
+  const cached = systemInfo.value?.cached_ram || 0
+  return Math.max(0, total - free - cached)
+})
+
+const memoryPercent = computed(() => {
+  const total = systemInfo.value?.total_ram || 1
+  return Math.min(100, Math.round((usedMemory.value / total) * 100))
 })
 
 // 计算CPU使用率
@@ -301,6 +329,123 @@ async function handleClearCache() {
           <button @click="fetchCurrentBand" class="mt-3 px-4 py-2 bg-purple-500/20 text-purple-600 dark:text-purple-400 rounded-xl hover:bg-purple-500/30 transition-all text-sm">
             <i class="fas fa-sync-alt mr-2"></i>{{ t('monitor.retryFetch') }}
           </button>
+        </div>
+
+        <!-- 5G NR 4天线信号、MIMO(4x4/2x2)、IMS 与硬件细粒度监控 (RM500U-CN) -->
+        <div v-if="nrRadioDetail" class="mt-4 pt-4 border-t border-slate-200 dark:border-white/10 space-y-3">
+          <!-- MIMO / 频宽 / IMS 状态徽章栏 -->
+          <div class="flex flex-wrap items-center gap-2">
+            <span
+              v-if="nrRadioDetail.is_nr"
+              class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-semibold border"
+              :class="(nrRadioDetail.dl_ri >= 3 || nrRadioDetail.active_ant_count >= 4)
+                ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/30'
+                : 'bg-blue-500/15 text-blue-700 dark:text-blue-300 border-blue-500/30'"
+            >
+              <i class="fas fa-broadcast-tower mr-1.5"></i>
+              {{ nrRadioDetail.mimo_label || '4x4 就绪' }}
+              <span v-if="nrRadioDetail.active_ant_count" class="ml-1 opacity-80">· {{ nrRadioDetail.active_ant_count }}R</span>
+            </span>
+            <span
+              v-if="nrRadioDetail.dl_bw_mhz > 0"
+              class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-semibold bg-purple-500/15 text-purple-700 dark:text-purple-300 border border-purple-500/30"
+            >
+              <i class="fas fa-wave-square mr-1.5"></i>
+              {{ nrRadioDetail.dl_bw_mhz }} MHz ({{ nrRadioDetail.dl_rb }} RB)
+            </span>
+            <span
+              v-if="nrRadioDetail.nr_arfcn > 0"
+              class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-500/10 text-slate-700 dark:text-white/80 border border-slate-300/60 dark:border-white/15"
+            >
+              ARFCN {{ nrRadioDetail.nr_arfcn }}
+            </span>
+            <span
+              class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-semibold border"
+              :class="nrRadioDetail.ims_registered
+                ? 'bg-teal-500/15 text-teal-700 dark:text-teal-300 border-teal-500/30'
+                : 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30'"
+            >
+              <i class="fas fa-phone-volume mr-1.5"></i>
+              {{ nrRadioDetail.ims_registered ? (nrRadioDetail.ims_caps || 'IMS已注册') : 'IMS未注册' }}
+            </span>
+          </div>
+
+          <!-- 4 根天线独立 RSRP / SINR -->
+          <div v-if="nrRadioDetail.has_ant" class="grid grid-cols-2 md:grid-cols-4 gap-2 sm:gap-3">
+            <div v-for="idx in [0, 1, 2, 3]" :key="idx" class="p-2.5 sm:p-3 bg-white/70 dark:bg-white/5 rounded-xl border border-slate-200/80 dark:border-white/10 text-center">
+              <p class="text-slate-500 dark:text-white/50 text-[10px] sm:text-xs">ANT{{ idx }} RSRP / SINR</p>
+              <p class="text-slate-800 dark:text-white font-bold text-xs sm:text-sm mt-0.5">
+                {{ nrRadioDetail[`ant${idx}_rsrp`] > -135 ? nrRadioDetail[`ant${idx}_rsrp`].toFixed(1) + ' dBm' : '--' }}
+                <span class="text-indigo-600 dark:text-indigo-400">
+                  / {{ nrRadioDetail[`ant${idx}_sinr`] > -40 ? nrRadioDetail[`ant${idx}_sinr`].toFixed(1) + ' dB' : '--' }}
+                </span>
+              </p>
+            </div>
+          </div>
+
+          <!-- 下行/上行 MIMO、调制阶数、MCS/RB -->
+          <div v-if="nrRadioDetail.has_synch" class="grid grid-cols-2 md:grid-cols-4 gap-2 sm:gap-3">
+            <div class="p-2.5 sm:p-3 bg-white/70 dark:bg-white/5 rounded-xl border border-slate-200/80 dark:border-white/10 text-center">
+              <p class="text-slate-500 dark:text-white/50 text-[10px] sm:text-xs">下行调制 / MIMO</p>
+              <p class="text-emerald-600 dark:text-emerald-400 font-bold text-xs sm:text-sm mt-0.5">
+                {{
+                  nrRadioDetail.dl_ri > 0
+                    ? `${nrRadioDetail.dl_mod_str} / ${nrRadioDetail.dl_ri}层`
+                    : (nrRadioDetail.dl_mcs > 0 || nrRadioDetail.dl_mod > 2
+                        ? `${nrRadioDetail.dl_mod_str} / 1层`
+                        : `${nrRadioDetail.dl_mod > 0 ? nrRadioDetail.dl_mod_str + ' ' : ''}(待机)`)
+                }} (CQI {{ nrRadioDetail.cqi }})
+              </p>
+            </div>
+            <div class="p-2.5 sm:p-3 bg-white/70 dark:bg-white/5 rounded-xl border border-slate-200/80 dark:border-white/10 text-center">
+              <p class="text-slate-500 dark:text-white/50 text-[10px] sm:text-xs">下行 MCS / RB</p>
+              <p class="text-slate-800 dark:text-white font-bold text-xs sm:text-sm mt-0.5">
+                MCS {{ nrRadioDetail.dl_mcs }} / {{ nrRadioDetail.dl_rb }} RB
+              </p>
+            </div>
+            <div class="p-2.5 sm:p-3 bg-white/70 dark:bg-white/5 rounded-xl border border-slate-200/80 dark:border-white/10 text-center">
+              <p class="text-slate-500 dark:text-white/50 text-[10px] sm:text-xs">上行调制 / MIMO</p>
+              <p class="text-blue-600 dark:text-blue-400 font-bold text-xs sm:text-sm mt-0.5">
+                {{ nrRadioDetail.ul_mod_str }} / {{ nrRadioDetail.ul_mimo_label || (nrRadioDetail.ul_ri + '层') }}
+              </p>
+            </div>
+            <div class="p-2.5 sm:p-3 bg-white/70 dark:bg-white/5 rounded-xl border border-slate-200/80 dark:border-white/10 text-center">
+              <p class="text-slate-500 dark:text-white/50 text-[10px] sm:text-xs">上行 MCS / RB</p>
+              <p class="text-slate-800 dark:text-white font-bold text-xs sm:text-sm mt-0.5">
+                MCS {{ nrRadioDetail.ul_mcs }} / {{ nrRadioDetail.ul_rb }} RB
+              </p>
+            </div>
+          </div>
+
+          <!-- 多点硬件温度、CPU主频与有线网口物理速率 -->
+          <div class="grid grid-cols-2 md:grid-cols-6 gap-2 sm:gap-2.5">
+            <div class="p-2 sm:p-2.5 bg-white/70 dark:bg-white/5 rounded-xl border border-slate-200/80 dark:border-white/10 text-center">
+              <p class="text-slate-500 dark:text-white/50 text-[10px]">SoC 温度</p>
+              <p class="text-slate-800 dark:text-white font-bold text-xs sm:text-sm mt-0.5">{{ nrRadioDetail.soc_temp ? nrRadioDetail.soc_temp.toFixed(1) + '°C' : '--' }}</p>
+            </div>
+            <div class="p-2 sm:p-2.5 bg-white/70 dark:bg-white/5 rounded-xl border border-slate-200/80 dark:border-white/10 text-center">
+              <p class="text-slate-500 dark:text-white/50 text-[10px]">5G 基带温度</p>
+              <p class="text-slate-800 dark:text-white font-bold text-xs sm:text-sm mt-0.5">{{ nrRadioDetail.nrcp_temp ? nrRadioDetail.nrcp_temp.toFixed(1) + '°C' : '--' }}</p>
+            </div>
+            <div class="p-2 sm:p-2.5 bg-white/70 dark:bg-white/5 rounded-xl border border-slate-200/80 dark:border-white/10 text-center">
+              <p class="text-slate-500 dark:text-white/50 text-[10px]">5G 功放 PA</p>
+              <p class="text-slate-800 dark:text-white font-bold text-xs sm:text-sm mt-0.5">{{ nrRadioDetail.pa5g_temp ? nrRadioDetail.pa5g_temp.toFixed(1) + '°C' : '--' }}</p>
+            </div>
+            <div class="p-2 sm:p-2.5 bg-white/70 dark:bg-white/5 rounded-xl border border-slate-200/80 dark:border-white/10 text-center">
+              <p class="text-slate-500 dark:text-white/50 text-[10px]">主板温度</p>
+              <p class="text-slate-800 dark:text-white font-bold text-xs sm:text-sm mt-0.5">{{ nrRadioDetail.board_temp ? nrRadioDetail.board_temp.toFixed(1) + '°C' : '--' }}</p>
+            </div>
+            <div class="p-2 sm:p-2.5 bg-white/70 dark:bg-white/5 rounded-xl border border-slate-200/80 dark:border-white/10 text-center">
+              <p class="text-slate-500 dark:text-white/50 text-[10px]">CPU 主频</p>
+              <p class="text-cyan-600 dark:text-cyan-400 font-bold text-xs sm:text-sm mt-0.5">{{ nrRadioDetail.cpu_freq_mhz ? nrRadioDetail.cpu_freq_mhz + ' MHz' : '--' }}</p>
+            </div>
+            <div class="p-2 sm:p-2.5 bg-white/70 dark:bg-white/5 rounded-xl border border-slate-200/80 dark:border-white/10 text-center">
+              <p class="text-slate-500 dark:text-white/50 text-[10px]">有线网口 eth0</p>
+              <p class="font-bold text-xs sm:text-sm mt-0.5" :class="nrRadioDetail.eth_link ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-400 dark:text-white/40'">
+                {{ nrRadioDetail.eth_link ? (nrRadioDetail.eth_speed + 'M ' + (nrRadioDetail.eth_duplex === 'full' ? '全双工' : nrRadioDetail.eth_duplex)) : '未连接' }}
+              </p>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -502,63 +647,6 @@ async function handleClearCache() {
       </div>
     </div>
 
-    <!-- 系统状态 - 卡片网格 -->
-    <div class="rounded-3xl bg-white/95 dark:bg-white/5 backdrop-blur-xl border border-slate-200/60 dark:border-white/10 p-6 shadow-xl shadow-slate-200/40 dark:shadow-black/20 hover:shadow-2xl hover:shadow-slate-300/50 dark:hover:shadow-black/30 transition-all duration-500">
-      <div class="flex items-center space-x-3 mb-6">
-        <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-red-500 to-pink-500 flex items-center justify-center">
-          <i class="fas fa-heartbeat text-white"></i>
-        </div>
-        <h3 class="text-slate-800 dark:text-white font-bold">{{ t('monitor.systemStatus') }}</h3>
-      </div>
-      
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-1.5 sm:gap-2 md:gap-3">
-        <div class="group relative overflow-hidden p-2 sm:p-3 md:p-4 bg-gradient-to-br from-orange-50 to-amber-50 dark:from-orange-500/10 dark:to-amber-500/10 rounded-xl sm:rounded-2xl border border-orange-200 dark:border-orange-500/20 hover:border-orange-500/50 transition-all hover:scale-105">
-          <div class="absolute -top-2 -right-2 w-12 h-12 bg-orange-500/20 rounded-full blur-xl group-hover:scale-150 transition-transform"></div>
-          <div class="relative text-center">
-            <div class="w-10 h-10 sm:w-12 sm:h-12 md:w-14 md:h-14 mx-auto mb-1.5 sm:mb-2 md:mb-3 rounded-xl sm:rounded-2xl bg-gradient-to-br from-orange-500 to-amber-400 flex items-center justify-center shadow-lg shadow-orange-500/30">
-              <i class="fas fa-temperature-high text-white text-sm sm:text-base md:text-xl"></i>
-            </div>
-            <p class="text-slate-600 dark:text-white/50 text-[10px] sm:text-xs mb-0.5">{{ t('monitor.temperature') }}</p>
-            <p class="text-slate-800 dark:text-white font-bold text-base sm:text-lg md:text-xl">{{ systemInfo?.thermal_temp || '-' }}</p>
-          </div>
-        </div>
-        
-        <div class="group relative overflow-hidden p-2 sm:p-3 md:p-4 bg-gradient-to-br from-green-50 to-emerald-50 dark:from-green-500/10 dark:to-emerald-500/10 rounded-xl sm:rounded-2xl border border-green-200 dark:border-green-500/20 hover:border-green-500/50 transition-all hover:scale-105">
-          <div class="absolute -top-2 -right-2 w-12 h-12 bg-green-500/20 rounded-full blur-xl group-hover:scale-150 transition-transform"></div>
-          <div class="relative text-center">
-            <div class="w-10 h-10 sm:w-12 sm:h-12 md:w-14 md:h-14 mx-auto mb-1.5 sm:mb-2 md:mb-3 rounded-xl sm:rounded-2xl bg-gradient-to-br from-green-500 to-emerald-400 flex items-center justify-center shadow-lg shadow-green-500/30">
-              <i class="fas fa-plug text-white text-sm sm:text-base md:text-xl"></i>
-            </div>
-            <p class="text-slate-600 dark:text-white/50 text-[10px] sm:text-xs mb-0.5">{{ t('monitor.power') }}</p>
-            <p class="text-slate-800 dark:text-white font-bold text-base sm:text-lg md:text-xl">{{ systemInfo?.power_status || '-' }}</p>
-          </div>
-        </div>
-        
-        <div class="group relative overflow-hidden p-2 sm:p-3 md:p-4 bg-gradient-to-br from-blue-50 to-cyan-50 dark:from-blue-500/10 dark:to-cyan-500/10 rounded-xl sm:rounded-2xl border border-blue-200 dark:border-blue-500/20 hover:border-blue-500/50 transition-all hover:scale-105">
-          <div class="absolute -top-2 -right-2 w-12 h-12 bg-blue-500/20 rounded-full blur-xl group-hover:scale-150 transition-transform"></div>
-          <div class="relative text-center">
-            <div class="w-10 h-10 sm:w-12 sm:h-12 md:w-14 md:h-14 mx-auto mb-1.5 sm:mb-2 md:mb-3 rounded-xl sm:rounded-2xl bg-gradient-to-br from-blue-500 to-cyan-400 flex items-center justify-center shadow-lg shadow-blue-500/30">
-              <i class="fas fa-heart-pulse text-white text-sm sm:text-base md:text-xl"></i>
-            </div>
-            <p class="text-slate-600 dark:text-white/50 text-[10px] sm:text-xs mb-0.5">{{ t('monitor.batteryHealth') }}</p>
-            <p class="text-slate-800 dark:text-white font-bold text-base sm:text-lg md:text-xl">{{ systemInfo?.battery_health || '-' }}</p>
-          </div>
-        </div>
-        
-        <div class="group relative overflow-hidden p-2 sm:p-3 md:p-4 bg-gradient-to-br from-purple-50 to-pink-50 dark:from-purple-500/10 dark:to-pink-500/10 rounded-xl sm:rounded-2xl border border-purple-200 dark:border-purple-500/20 hover:border-purple-500/50 transition-all hover:scale-105">
-          <div class="absolute -top-2 -right-2 w-12 h-12 bg-purple-500/20 rounded-full blur-xl group-hover:scale-150 transition-transform"></div>
-          <div class="relative text-center">
-            <div class="w-10 h-10 sm:w-12 sm:h-12 md:w-14 md:h-14 mx-auto mb-1.5 sm:mb-2 md:mb-3 rounded-xl sm:rounded-2xl bg-gradient-to-br from-purple-500 to-pink-400 flex items-center justify-center shadow-lg shadow-purple-500/30">
-              <i class="fas fa-battery-three-quarters text-white text-sm sm:text-base md:text-xl"></i>
-            </div>
-            <p class="text-slate-600 dark:text-white/50 text-[10px] sm:text-xs mb-0.5">{{ t('monitor.batteryCapacity') }}</p>
-            <p class="text-slate-800 dark:text-white font-bold text-base sm:text-lg md:text-xl">{{ systemInfo?.battery_capacity || '-' }}</p>
-          </div>
-        </div>
-      </div>
-    </div>
-
- 
    <!-- 系统详情 -->
     <div class="rounded-3xl bg-white dark:bg-white/5 backdrop-blur-xl border border-slate-200 dark:border-white/10 p-6">
       <div class="flex items-center space-x-3 mb-6">
@@ -596,11 +684,11 @@ async function handleClearCache() {
         <div class="group p-4 bg-slate-100 dark:bg-white/5 rounded-2xl hover:bg-slate-200 dark:hover:bg-white/10 transition-all border border-slate-200 dark:border-white/5 hover:border-slate-300 dark:hover:border-white/20">
           <div class="flex items-center space-x-4">
             <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-600 to-cyan-500 flex items-center justify-center">
-              <i class="fab fa-qq text-white"></i>
+              <i class="fas fa-microchip text-white"></i>
             </div>
             <div>
-              <p class="text-slate-600 dark:text-white/50 text-xs">{{ t('monitor.qqGroup') }}</p>
-              <p class="text-slate-800 dark:text-white font-mono text-sm">1029148488</p>
+              <p class="text-slate-600 dark:text-white/50 text-xs">模组型号 / 固件版本</p>
+              <p class="text-slate-800 dark:text-white font-mono text-xs break-all">{{ systemInfo?.model || 'RM500U-CN' }} {{ systemInfo?.fw_version ? '· ' + systemInfo.fw_version : '' }}</p>
             </div>
           </div>
         </div>

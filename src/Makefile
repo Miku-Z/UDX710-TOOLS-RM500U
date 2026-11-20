@@ -1,19 +1,22 @@
 # Makefile for ofono-server - Cross compile for aarch64-linux-gnu
 
-CC = aarch64-linux-gnu-gcc
+CC ?= aarch64-linux-gnu-gcc
+STRIP ?= aarch64-linux-gnu-strip
 # 移除 -DDISABLE_PRINTF 以启用调试输出
 # 添加 -DDISABLE_PRINTF 禁用所有printf输出
 # 添加 -DMG_ENABLE_IPV6=1 启用IPv6支持
-CFLAGS = -Wall -O2 -g -DMG_ENABLE_LINES=0 -include debug.h -DDISABLE_PRINTF
+CFLAGS ?= -Wall -O2 -g
+override CFLAGS += -Wall -O2 -g -DMG_ENABLE_LINES=0 -include debug.h -DDISABLE_PRINTF
 
 # GLib 库路径
 GLIB_DIR = ..
+
 INCLUDES = -I$(GLIB_DIR)/include/glib-2.0 \
            -I$(GLIB_DIR)/lib/glib-2.0/include \
            -I$(GLIB_DIR)/include/gio-unix-2.0 \
            -I. -Iinclude -Iinclude/system -Iinclude/handlers -Iinclude/lib
 
-LDFLAGS = -L$(GLIB_DIR)/lib -Wl,-rpath-link,$(GLIB_DIR)/lib -Wl,--allow-shlib-undefined
+LDFLAGS += -L$(GLIB_DIR)/lib -Wl,-rpath-link,$(GLIB_DIR)/lib -Wl,--allow-shlib-undefined
 LIBS = -lgio-2.0 -lgobject-2.0 -lglib-2.0 -lgmodule-2.0 -lpthread
 
 BUILD_DIR = build
@@ -46,7 +49,7 @@ all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
-	aarch64-linux-gnu-strip $@
+	$(STRIP) $@
 	@echo "Build complete: $@"
 
 # 主目录源文件

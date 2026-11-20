@@ -288,10 +288,8 @@ const menuItems = [
   { id: 'advanced', labelKey: 'menu.advanced', icon: 'fa-tower-cell', color: 'from-cyan-500 to-blue-500' },
   { id: 'sms', labelKey: 'menu.sms', icon: 'fa-envelope', color: 'from-emerald-500 to-teal-400' },
   { id: 'traffic', labelKey: 'menu.traffic', icon: 'fa-chart-area', color: 'from-green-500 to-emerald-400' },
-  { id: 'battery', labelKey: 'menu.battery', icon: 'fa-battery-half', color: 'from-yellow-500 to-amber-400' },
   { id: 'rathole', labelKey: 'menu.rathole', icon: 'fa-shield-alt', color: 'from-indigo-500 to-violet-400' },
   { id: 'ipv6proxy', labelKey: 'menu.ipv6proxy', icon: 'fa-network-wired', color: 'from-cyan-500 to-blue-400' },
-  { id: 'update', labelKey: 'menu.update', icon: 'fa-cloud-download-alt', color: 'from-violet-500 to-purple-400' },
   { id: 'at', labelKey: 'menu.at', icon: 'fa-terminal', color: 'from-cyan-500 to-teal-400' },
   { id: 'terminal', labelKey: 'menu.terminal', icon: 'fa-desktop', color: 'from-slate-500 to-gray-400' },
   { id: 'usb', labelKey: 'menu.usb', icon: ['fab', 'usb'], color: 'from-purple-500 to-pink-400' },
@@ -700,8 +698,6 @@ onUnmounted(() => {
     </main>
     <GlobalToast />
     <GlobalConfirm />
-    <!-- 更新通知弹窗 -->
-    <UpdateNotification v-if="isAuthenticated" @go-update="handleGoUpdate" />
   </div>
 </template>
 

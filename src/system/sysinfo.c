@@ -53,19 +53,25 @@ double get_uptime(void) {
 
 
 int get_serial(char *serial, size_t size) {
-    char buf[1024];
-    if (read_file("/home/cpuinfo", buf, sizeof(buf)) != 0) return -1;
+    char buf[2048];
+    if (read_file("/proc/cpuinfo", buf, sizeof(buf)) != 0 &&
+        read_file("/home/cpuinfo", buf, sizeof(buf)) != 0) {
+        return -1;
+    }
 
     char *p = strstr(buf, "Serial");
     if (!p) return -1;
 
-    /* 跳过 "Serial" 和非数字字符 */
+    /* 跳过 "Serial" 和非十六进制分隔符 (如 "\t: ") */
     p += 6;
-    while (*p && (*p < '0' || *p > '9')) p++;
+    while (*p && !((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'))) {
+        if (*p == '\n') return -1;
+        p++;
+    }
 
-    /* 提取数字 */
+    /* 提取十六进制序列号 */
     size_t i = 0;
-    while (*p >= '0' && *p <= '9' && i < size - 1) {
+    while (((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) && i < size - 1) {
         serial[i++] = *p++;
     }
     serial[i] = '\0';
@@ -181,11 +187,56 @@ int get_system_info(SystemInfo *info) {
     /* 序列号 */
     get_serial(info->serial, sizeof(info->serial));
 
-    /* SIM 卡槽 */
-    char ril_path[32];
-    if (get_current_slot(info->sim_slot, ril_path) == 0) {
-        strncpy(info->network_mode, ril_path, sizeof(info->network_mode) - 1);
+    /* 设备型号与固件版本 (/etc/quectel-project-name) */
+    strncpy(info->model, "RM500U-CN", sizeof(info->model) - 1);
+    if (read_file("/etc/quectel-project-name", buf, sizeof(buf)) == 0) {
+        char *m = strstr(buf, "module_model=");
+        if (m) {
+            m += strlen("module_model=");
+            char *end = strpbrk(m, "\r\n");
+            size_t len = end ? (size_t)(end - m) : strlen(m);
+            if (len > 0) {
+                if (len >= sizeof(info->model)) len = sizeof(info->model) - 1;
+                memcpy(info->model, m, len);
+                info->model[len] = '\0';
+            }
+        }
+        char *fw = strstr(buf, "fw_version=");
+        if (fw) {
+            fw += strlen("fw_version=");
+            char *end = strpbrk(fw, "\r\n");
+            size_t len = end ? (size_t)(end - fw) : strlen(fw);
+            if (len > 0) {
+                if (len >= sizeof(info->fw_version)) len = sizeof(info->fw_version) - 1;
+                memcpy(info->fw_version, fw, len);
+                info->fw_version[len] = '\0';
+            }
+        }
     }
+
+    /* 若配置文件未读到固件版本，尝试标准 AT+CGMR 提取基带版本 */
+    if (strlen(info->fw_version) == 0) {
+        extern int execute_at(const char *command, char **result);
+        char *at_res = NULL;
+        if (execute_at("AT+CGMR", &at_res) == 0 && at_res) {
+            char *bv = strstr(at_res, "BASE");
+            char *pv = bv ? strchr(bv, ':') : NULL;
+            if (pv) {
+                pv++;
+                while (*pv == ' ' || *pv == '\t') pv++;
+                char *end = strpbrk(pv, "\r\n");
+                size_t len = end ? (size_t)(end - pv) : strlen(pv);
+                if (len >= sizeof(info->fw_version)) len = sizeof(info->fw_version) - 1;
+                memcpy(info->fw_version, pv, len);
+                info->fw_version[len] = '\0';
+            }
+            g_free(at_res);
+        }
+    }
+
+    /* SIM 卡槽 */
+    char ril_path[32] = {0};
+    get_current_slot(info->sim_slot, ril_path);
 
     /* 信号强度 */
     get_signal_strength(info->signal_strength, sizeof(info->signal_strength));
@@ -237,12 +288,37 @@ int get_system_info(SystemInfo *info) {
         }
     }
 
-    /* 网络模式选择 - 使用 ofono D-Bus 接口 */
+    /* 网络模式选择 - 优先使用 ofono D-Bus，失败则回退到 AT+SPTESTMODE? */
     char mode_buf[64] = {0};
+    int got_mode = 0;
     if (strcmp(ril_path, "unknown") != 0 && strlen(ril_path) > 0) {
-        if (ofono_network_get_mode_sync(ril_path, mode_buf, sizeof(mode_buf), OFONO_TIMEOUT_MS) == 0) {
+        if (ofono_network_get_mode_sync(ril_path, mode_buf, sizeof(mode_buf), OFONO_TIMEOUT_MS) == 0 &&
+            strlen(mode_buf) > 0) {
             strncpy(info->select_network_mode, mode_buf, sizeof(info->select_network_mode) - 1);
+            got_mode = 1;
         }
+    }
+    if (!got_mode) {
+        extern int execute_at(const char *command, char **result);
+        char *at_res = NULL;
+        if (execute_at("AT+SPTESTMODE?", &at_res) == 0 && at_res) {
+            char *p = strstr(at_res, "+SPTESTMODE:");
+            if (p) {
+                int code = atoi(p + strlen("+SPTESTMODE:"));
+                const char *mstr = NULL;
+                if (code == 24) mstr = "LTE only";
+                else if (code == 128) mstr = "NSA only";
+                else if (code == 131) mstr = "NR 5G only";
+                else if (code == 152) mstr = "NR 5G/LTE auto";
+                if (mstr) {
+                    strncpy(info->select_network_mode, mstr, sizeof(info->select_network_mode) - 1);
+                }
+            }
+            g_free(at_res);
+        }
+    }
+    if (strlen(info->select_network_mode) > 0) {
+        strncpy(info->network_mode, info->select_network_mode, sizeof(info->network_mode) - 1);
     }
 
     /* 网络类型和频段 */
@@ -333,6 +409,31 @@ int get_network_type_and_band(char *net_type, size_t type_size, char *band, size
         }
     }
 
+    /* 若 ofono 未返回频段，使用安全的 AT+SPENGMD 兜底提取主小区频段 */
+    if (strcmp(band, "N/A") == 0) {
+        extern int execute_at(const char *command, char **result);
+        char *res = NULL;
+        const char *cmd = NULL;
+        char prefix = 0;
+        if (strcmp(net_type, "5G NR") == 0) {
+            cmd = "AT+SPENGMD=0,14,1";
+            prefix = 'N';
+        } else if (strcmp(net_type, "4G LTE") == 0) {
+            cmd = "AT+SPENGMD=0,6,0";
+            prefix = 'B';
+        }
+        if (cmd && execute_at(cmd, &res) == 0 && res) {
+            char *p = strstr(res, "+SPENGMD:");
+            p = p ? (p + strlen("+SPENGMD:")) : res;
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+            int b = atoi(p);
+            if (b > 0) {
+                snprintf(band, band_size, "%c%d", prefix, b);
+            }
+            g_free(res);
+        }
+    }
+
     return 0;
 }
 
@@ -372,7 +473,7 @@ double get_cpu_usage(void) {
     if (ret < 7) softirq = 0;
     if (ret < 8) steal = 0;
     
-    /* 首次调用，保存数据并返回0 */
+    /* 首次调用，保存数据并短采样 100ms 以便首包即返回真实 CPU 使用率 */
     if (!cpu_initialized) {
         prev_user = user;
         prev_nice = nice;
@@ -383,7 +484,8 @@ double get_cpu_usage(void) {
         prev_softirq = softirq;
         prev_steal = steal;
         cpu_initialized = 1;
-        return 0;
+        usleep(100000);
+        return get_cpu_usage();
     }
     
     /* 计算差值 */

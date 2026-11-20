@@ -33,10 +33,11 @@ watch(() => systemInfo.value, (info) => {
     airplaneMode.value = info.airplane_mode === true || info.airplane_mode === 1
     currentSlot.value = info.sim_slot || 'slot1'
     if (info.select_network_mode) {
-      if (info.select_network_mode.includes('LTE only')) selectedNetworkMode.value = 'lte_only'
-      else if (info.select_network_mode.includes('NR 5G only')) selectedNetworkMode.value = 'nr_5g_only'
-      else if (info.select_network_mode.includes('NR 5G/LTE auto')) selectedNetworkMode.value = 'nr_5g_lte_auto'
-      else if (info.select_network_mode.includes('NSA only')) selectedNetworkMode.value = 'nsa_only'
+      const m = info.select_network_mode
+      if (m.includes('LTE only')) selectedNetworkMode.value = 'lte_only'
+      else if (m.includes('NSA only') || m.includes('NR5G NSA')) selectedNetworkMode.value = 'nsa_only'
+      else if (m.includes('NR 5G only') || m.includes('NR5GSA') || m.includes('NR5G ONLY')) selectedNetworkMode.value = 'nr_5g_only'
+      else if (m.includes('NR 5G/LTE') || m.includes('NR5G/LTE')) selectedNetworkMode.value = 'nr_5g_lte_auto'
     }
   }
 }, { immediate: true })
@@ -270,35 +271,6 @@ onMounted(() => {
               </div>
             </div>
             <div v-if="currentSlot === 'slot1'" class="mt-3 pt-3 border-t border-slate-200 dark:border-white/10">
-              <p class="text-slate-500 dark:text-white/50 text-sm">{{ t('monitor.signalStrength') }}: <span class="text-green-600 dark:text-green-400 font-medium">{{ systemInfo?.signal_strength ?? 'N/A' }}</span></p>
-            </div>
-          </div>
-
-          <!-- SIM卡槽2 -->
-          <div 
-            class="p-4 rounded-xl border transition-all cursor-pointer"
-            :class="currentSlot === 'slot2' 
-              ? 'bg-gradient-to-r from-green-500/20 to-emerald-500/20 border-green-500/50' 
-              : 'bg-slate-100 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:border-slate-400 dark:hover:border-white/30'"
-            @click="handleSlotSwitch('slot2')"
-          >
-            <div class="flex items-center justify-between">
-              <div class="flex items-center space-x-3">
-                <div class="w-12 h-12 rounded-xl flex items-center justify-center"
-                  :class="currentSlot === 'slot2' ? 'bg-green-500/30' : 'bg-slate-200 dark:bg-white/10'">
-                  <i class="fas fa-sim-card text-xl" :class="currentSlot === 'slot2' ? 'text-green-400' : 'text-slate-400 dark:text-white/40'"></i>
-                </div>
-                <div>
-                  <p class="text-slate-900 dark:text-white font-medium">{{ t('network.slot2') }}</p>
-                  <p class="text-slate-500 dark:text-white/50 text-sm">{{ currentSlot === 'slot2' ? t('common.enabled') : '' }}</p>
-                </div>
-              </div>
-              <div v-if="currentSlot === 'slot2'" class="flex items-center space-x-2">
-                <span class="px-2 py-1 bg-green-500/20 text-green-400 text-xs rounded-full">{{ t('common.enabled') }}</span>
-                <i class="fas fa-check-circle text-green-400"></i>
-              </div>
-            </div>
-            <div v-if="currentSlot === 'slot2'" class="mt-3 pt-3 border-t border-slate-200 dark:border-white/10">
               <p class="text-slate-500 dark:text-white/50 text-sm">{{ t('monitor.signalStrength') }}: <span class="text-green-600 dark:text-green-400 font-medium">{{ systemInfo?.signal_strength ?? 'N/A' }}</span></p>
             </div>
           </div>

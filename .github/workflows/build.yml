@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-arm:
     runs-on: ubuntu-latest
@@ -21,17 +24,19 @@ jobs:
       - name: Cache cross compiler (aarch64)
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/tools/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu
-          key: gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu
+          path: ${{ github.workspace }}/tools/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu
+          key: gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu
 
       - name: Configure cross compiler (aarch64)
         run: |
           mkdir -p $GITHUB_WORKSPACE/tools
-          if [ ! -d "$GITHUB_WORKSPACE/tools/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu" ]; then
-            wget https://releases.linaro.org/components/toolchain/binaries/7.5-2019.12/aarch64-linux-gnu/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
-            tar xf gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz -C $GITHUB_WORKSPACE/tools
+          if [ ! -d "$GITHUB_WORKSPACE/tools/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu" ]; then
+            curl -fL --retry 3 -o gcc-arm-9.2.tar.xz \
+              https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu-a/9.2-2019.12/binrel/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz
+            tar -xf gcc-arm-9.2.tar.xz -C $GITHUB_WORKSPACE/tools
+            rm -f gcc-arm-9.2.tar.xz
           fi
-          echo "PATH=$PATH:$GITHUB_WORKSPACE/tools/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu/bin" >> $GITHUB_ENV
+          echo "$GITHUB_WORKSPACE/tools/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu/bin" >> $GITHUB_PATH
 
       - name: build web
         run: |
@@ -41,16 +46,21 @@ jobs:
       - name: build server
         run: |
           cd src
-          make
+          make CC=aarch64-none-linux-gnu-gcc STRIP=aarch64-none-linux-gnu-strip
+          file build/ofono-server
+          readelf -V build/ofono-server | grep "Name: GLIBC_"
 
       - name: dopack
         run: |
           mkdir -p output/6677
-          echo "#!/bin/sh" > start.sh
-          echo "cd /home/root/6677" >> start.sh
-          echo "chmod 755 *" >> start.sh
-          echo "./server &" >> start.sh
-          mv start.sh output/6677/
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'mount -o remount,rw / 2>/dev/null || true' \
+            'cd "$(dirname "$0")"' \
+            'chmod 755 server start.sh' \
+            'PORT="${1:-6677}"' \
+            './server "$PORT" &' > output/6677/start.sh
+          chmod +x output/6677/start.sh
           cp -r web/dist output/6677/
           cp src/build/ofono-server output/6677/server
 
@@ -59,4 +69,33 @@ jobs:
         with:
           name: udx710-tools
           path: output
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          PKG_TAR="udx710-tools-${TAG}.tar.gz"
+          PKG_ZIP="udx710-tools-${TAG}.zip"
+          tar -czf "$PKG_TAR" -C output 6677
+          (cd output && python3 -c "import shutil; shutil.make_archive('../udx710-tools-' + '${TAG}', 'zip', '.', '6677')")
+          printf '%s\n' \
+            "RM500U-CN adapted build of UDX710-TOOLS (compiled cleanly on GitHub Actions with gcc-arm-9.2-2019.12, GLIBC_2.17+)." \
+            "" \
+            "### Package Contents (\`6677/\`)" \
+            "- \`server\`: \`aarch64\` backend binary (\`ofono-server\`)" \
+            "- \`dist/\`: built Vue frontend assets" \
+            "- \`start.sh\`: portable launcher (\`./start.sh [port]\`, default \`6677\`)" \
+            "" \
+            "### Highlights" \
+            "- 5G NR 4-antenna RSRP/SINR, fixed MIMO rank/MCS/bandwidth & 2.5s real-time polling" \
+            "- 5G SA SMS TX/RX (\`AT+IMSEN=1\`, \`ME -> SQLite\` auto-drain & UDH concat reassembly)" \
+            "- RM500U-CN adaptations (\`/etc/quectel-project-name\`, \`/mnt/data/usbenum.ini\` + \`sync()\`, \`net-tools 2.x\`, multi-zone thermals, \`eth0\` link monitor)" \
+            > release_notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$PKG_TAR" "$PKG_ZIP" --clobber
+          else
+            gh release create "$TAG" "$PKG_TAR" "$PKG_ZIP" --title "UDX710-TOOLS RM500U-CN ${TAG}" --notes-file release_notes.md
+          fi
 

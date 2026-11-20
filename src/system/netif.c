@@ -17,7 +17,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define VNSTAT_PATH "/home/root/6677/vnstat"
+#define VNSTAT_PATH (access("./vnstat", X_OK) == 0 ? "./vnstat" : "/home/root/6677/vnstat")
 
 /* 全局监听器数组 */
 static NetifMonitor g_monitors[MAX_NET_INTERFACES];
@@ -33,95 +33,135 @@ static int parse_ifconfig_output(const char *output, NetInterface *interfaces,
   NetInterface *iface = NULL;
 
   while (*p && count < max_count) {
+    const char *eol = strchr(p, '\n');
+    size_t line_len = eol ? (size_t)(eol - p) : strlen(p);
+    char line[512];
+    if (line_len >= sizeof(line))
+      line_len = sizeof(line) - 1;
+    memcpy(line, p, line_len);
+    line[line_len] = '\0';
+
     /* 检测接口名称行（不以空格开头） */
-    if (!isspace(*p)) {
+    if (line_len > 0 && !isspace((unsigned char)line[0])) {
       /* 新接口开始 */
       iface = &interfaces[count];
       memset(iface, 0, sizeof(NetInterface));
 
-      /* 提取接口名称 */
-      const char *name_end = p;
-      while (*name_end && !isspace(*name_end))
+      /* 提取接口名称，兼容 net-tools 2.x 的 "eth0:" 末尾冒号 */
+      const char *name_end = line;
+      while (*name_end && !isspace((unsigned char)*name_end))
         name_end++;
-      size_t name_len = name_end - p;
+      size_t name_len = (size_t)(name_end - line);
+      if (name_len > 0 && line[name_len - 1] == ':')
+        name_len--;
       if (name_len >= sizeof(iface->name))
         name_len = sizeof(iface->name) - 1;
-      strncpy(iface->name, p, name_len);
+      strncpy(iface->name, line, name_len);
       iface->name[name_len] = '\0';
 
       count++;
     }
 
     if (iface) {
-      /* 解析HWaddr */
-      const char *hw = strstr(p, "HWaddr ");
-      if (hw && (hw - p) < 200) {
+      /* 解析 HWaddr (net-tools 1.x) 或 ether (net-tools 2.x) */
+      const char *hw = strstr(line, "HWaddr ");
+      if (hw) {
         hw += 7;
+      } else {
+        hw = strstr(line, "ether ");
+        if (hw)
+          hw += 6;
+      }
+      if (hw) {
+        while (*hw == ' ')
+          hw++;
         const char *hw_end = hw;
-        while (*hw_end && !isspace(*hw_end) && *hw_end != '\n')
+        while (*hw_end && !isspace((unsigned char)*hw_end))
           hw_end++;
-        size_t hw_len = hw_end - hw;
+        size_t hw_len = (size_t)(hw_end - hw);
         if (hw_len < sizeof(iface->hwaddr)) {
           strncpy(iface->hwaddr, hw, hw_len);
           iface->hwaddr[hw_len] = '\0';
         }
       }
 
-      /* 解析inet addr */
-      const char *inet = strstr(p, "inet addr:");
-      if (inet && (inet - p) < 200) {
+      /* 解析 inet addr: (1.x) 或 inet <ip> netmask <mask> (2.x) */
+      const char *inet = strstr(line, "inet addr:");
+      if (inet) {
         inet += 10;
+      } else {
+        const char *t = strstr(line, "inet ");
+        if (t && strncmp(t, "inet6", 5) != 0)
+          inet = t + 5;
+      }
+      if (inet) {
+        while (*inet == ' ')
+          inet++;
         const char *inet_end = inet;
-        while (*inet_end && !isspace(*inet_end))
+        while (*inet_end && !isspace((unsigned char)*inet_end))
           inet_end++;
-        size_t inet_len = inet_end - inet;
+        size_t inet_len = (size_t)(inet_end - inet);
         if (inet_len < sizeof(iface->inet_addr)) {
           strncpy(iface->inet_addr, inet, inet_len);
           iface->inet_addr[inet_len] = '\0';
         }
       }
 
-      /* 解析Mask */
-      const char *mask = strstr(p, "Mask:");
-      if (mask && (mask - p) < 200) {
+      /* 解析 Mask: (1.x) 或 netmask <mask> (2.x) */
+      const char *mask = strstr(line, "Mask:");
+      if (mask) {
         mask += 5;
+      } else {
+        mask = strstr(line, "netmask ");
+        if (mask)
+          mask += 8;
+      }
+      if (mask) {
+        while (*mask == ' ')
+          mask++;
         const char *mask_end = mask;
-        while (*mask_end && !isspace(*mask_end) && *mask_end != '\n')
+        while (*mask_end && !isspace((unsigned char)*mask_end))
           mask_end++;
-        size_t mask_len = mask_end - mask;
+        size_t mask_len = (size_t)(mask_end - mask);
         if (mask_len < sizeof(iface->mask)) {
           strncpy(iface->mask, mask, mask_len);
           iface->mask[mask_len] = '\0';
         }
       }
 
-      /* 解析inet6 addr */
-      const char *inet6 = strstr(p, "inet6 addr:");
-      if (inet6 && (inet6 - p) < 200) {
-        inet6 += 12;
+      /* 解析 inet6 addr: (1.x) 或 inet6 <ip> (2.x) */
+      const char *inet6 = strstr(line, "inet6 addr:");
+      if (inet6) {
+        inet6 += 11;
+      } else {
+        inet6 = strstr(line, "inet6 ");
+        if (inet6)
+          inet6 += 6;
+      }
+      if (inet6) {
         while (*inet6 == ' ')
           inet6++;
         const char *inet6_end = inet6;
-        while (*inet6_end && !isspace(*inet6_end))
+        while (*inet6_end && !isspace((unsigned char)*inet6_end))
           inet6_end++;
-        size_t inet6_len = inet6_end - inet6;
+        size_t inet6_len = (size_t)(inet6_end - inet6);
         if (inet6_len < sizeof(iface->inet6_addr)) {
           strncpy(iface->inet6_addr, inet6, inet6_len);
           iface->inet6_addr[inet6_len] = '\0';
         }
       }
 
-      /* 检查UP状态 */
-      if (strstr(p, "UP ") || strstr(p, "UP\n")) {
+      /* 检查 UP 状态 (兼容 1.x "UP " 与 2.x "<UP,..." ) */
+      if (strstr(line, "<UP,") || strstr(line, "<UP>") || strstr(line, ",UP,") ||
+          strstr(line, ",UP>") || strstr(line, " UP ") ||
+          (line_len >= 2 && strcmp(line + line_len - 2, "UP") == 0)) {
         iface->is_up = 1;
       }
     }
 
-    /* 移动到下一行 */
-    while (*p && *p != '\n')
-      p++;
-    if (*p == '\n')
-      p++;
+    if (!eol)
+      break;
+    p = eol + 1;
   }
 
   return count;

@@ -52,6 +52,8 @@ void handle_info(struct mg_connection *c, struct mg_http_message *hm) {
   json_add_str(j, "select_network_mode", info.select_network_mode);
   json_add_int(j, "is_activated", info.is_activated);
   json_add_str(j, "serial", info.serial);
+  json_add_str(j, "model", info.model);
+  json_add_str(j, "fw_version", info.fw_version);
   json_add_str(j, "network_mode", info.network_mode);
   json_add_bool(j, "airplane_mode", info.airplane_mode);
   json_add_str(j, "imei", info.imei);
@@ -160,42 +162,10 @@ void handle_set_network(struct mg_connection *c, struct mg_http_message *hm) {
   }
 }
 
-/* POST /api/switch - 切换 SIM 卡槽 */
+/* POST /api/switch - 切换 SIM 卡槽 (RM500U-CN 单卡槽不支持) */
 void handle_switch(struct mg_connection *c, struct mg_http_message *hm) {
   HTTP_CHECK_POST(c, hm);
-
-  char slot[16] = {0};
-  char *slot_str = mg_json_get_str(hm->body, "$.slot");
-  if (slot_str) {
-    strncpy(slot, slot_str, sizeof(slot) - 1);
-    free(slot_str);
-  }
-
-  if (strlen(slot) == 0) {
-    HTTP_ERROR(c, 400, "Slot parameter is required");
-    return;
-  }
-
-  if (!is_valid_slot(slot)) {
-    HTTP_ERROR(c, 400, "Invalid slot value. Must be 'slot1' or 'slot2'");
-    return;
-  }
-
-  JsonBuilder *j = json_new();
-  json_obj_open(j);
-  if (switch_slot(slot) == 0) {
-    json_add_str(j, "status", "success");
-    char msg[64];
-    snprintf(msg, sizeof(msg), "Slot switched to %s successfully", slot);
-    json_add_str(j, "message", msg);
-  } else {
-    json_add_str(j, "status", "error");
-    char msg[64];
-    snprintf(msg, sizeof(msg), "Failed to switch slot to %s", slot);
-    json_add_str(j, "message", msg);
-  }
-  json_obj_close(j);
-  HTTP_OK_FREE(c, json_finish(j));
+  HTTP_OK(c, "{\"status\":\"error\",\"message\":\"RM500U-CN 单卡硬件不支持卡槽切换\"}");
 }
 
 /* POST /api/airplane_mode - 飞行模式控制 */
@@ -490,7 +460,267 @@ void handle_get_current_band(struct mg_connection *c,
   HTTP_OK_FREE(c, json_finish(j));
 }
 
-/* ==================== 短信 API ==================== */
+static int parse_sp5gcmds_ints(const char *raw, int *out, int max_count) {
+  if (!raw) return 0;
+  const char *p = strstr(raw, "+SP5GCMDS:");
+  p = p ? (p + strlen("+SP5GCMDS:")) : raw;
+  int n = 0;
+  while (*p && n < max_count) {
+    while (*p && (*p == ' ' || *p == '\t' || *p == ',' || *p == '\r' || *p == '\n')) p++;
+    if (!*p || strncmp(p, "OK", 2) == 0) break;
+    if ((*p >= '0' && *p <= '9') || *p == '-') {
+      char *endp = NULL;
+      long v = strtol(p, &endp, 10);
+      if (endp != p) {
+        out[n++] = (int)v;
+        p = endp;
+        continue;
+      }
+    }
+    p++;
+  }
+  return n;
+}
+
+static const char *mod_order_to_str(int mod) {
+  switch (mod) {
+    case 2: return "QPSK";
+    case 4: return "16QAM";
+    case 6: return "64QAM";
+    case 8: return "256QAM";
+    default: return "N/A";
+  }
+}
+
+static int read_sysfs_int(const char *path, int fallback) {
+  FILE *fp = fopen(path, "r");
+  if (!fp) return fallback;
+  int val = fallback;
+  if (fscanf(fp, "%d", &val) != 1) val = fallback;
+  fclose(fp);
+  return val;
+}
+
+static void read_sysfs_str(const char *path, char *buf, size_t size) {
+  if (!buf || size == 0) return;
+  buf[0] = '\0';
+  FILE *fp = fopen(path, "r");
+  if (!fp) return;
+  if (fgets(buf, (int)size, fp)) {
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' || buf[len - 1] == ' ')) {
+      buf[--len] = '\0';
+    }
+  }
+  fclose(fp);
+}
+
+static int nr_rb_to_bw_mhz(int rb) {
+  if (rb >= 270) return 100;
+  if (rb >= 240) return 90;
+  if (rb >= 215) return 80;
+  if (rb >= 185) return 70;
+  if (rb >= 160) return 60;
+  if (rb >= 130) return 50;
+  if (rb >= 104) return 40;
+  if (rb >= 76)  return 30;
+  if (rb >= 50)  return 20;
+  if (rb >= 24)  return 10;
+  return 0;
+}
+
+/* GET /api/nr_radio_detail - 4天线 RSRP/SINR、MIMO(4x4/2x2)、调制、IMS与硬件温度/网口详情 */
+void handle_nr_radio_detail(struct mg_connection *c,
+                            struct mg_http_message *hm) {
+  HTTP_CHECK_GET(c, hm);
+
+  double ant_rsrp[4] = {0};
+  double ant_sinr[4] = {0};
+  int has_ant = 0;
+  int active_ant_count = 0;
+  int cqi = 0, dl_ri = 0, dl_rb = 0, dl_mcs = 0, dl_mod = 0, nr_arfcn = 0;
+  int ul_rb = 0, ul_mcs = 0, ul_mod = 0, ul_ri = 0;
+  int has_synch = 0;
+
+  /* 仅在 NR 5G 驻网时查询 SP5GCMDS，避免 LTE/WCDMA 下触发 sprd-ril 50s AT 超时阻塞 */
+  char tech[32] = {0};
+  int is_nr = (ofono_get_serving_cell_tech(tech, sizeof(tech)) == 0 &&
+               (strcasecmp(tech, "nr") == 0 || strcasecmp(tech, "5g") == 0 ||
+                strstr(tech, "NR") != NULL || strstr(tech, "nr") != NULL));
+
+  char *res = NULL;
+  if (is_nr && execute_at("AT+SP5GCMDS=\"get nr atenna rssi\"", &res) == 0 && res) {
+    int vals[32] = {0};
+    int cnt = parse_sp5gcmds_ints(res, vals, 32);
+    if (cnt >= 8) {
+      has_ant = 1;
+      for (int i = 0; i < 4; i++) {
+        ant_rsrp[i] = vals[i] / 100.0;
+        ant_sinr[i] = vals[cnt - 4 + i] / 100.0;
+        if (vals[i] > -13500 && vals[i] < 0) {
+          active_ant_count++;
+        }
+      }
+    }
+    g_free(res);
+    res = NULL;
+  }
+
+  /* 实测索引 (vals[0]=16): [1]=CQI [2]=DL额外Rank指示(0基) [4]=DL_RB [6]=DL_MCS [7]=DL_MOD [10]=DL调度量 [15]=ARFCN [23]=UL_RB [24]=UL_RI [25]=UL_MCS [26]=UL_MOD [29]=DL活跃Rank */
+  if (is_nr && execute_at("AT+SP5GCMDS=\"get nr synch_param\",16", &res) == 0 && res) {
+    int vals[48] = {0};
+    int cnt = parse_sp5gcmds_ints(res, vals, 48);
+    if (cnt >= 30) {
+      has_synch = 1;
+      cqi      = vals[1];
+      dl_rb    = vals[4];
+      dl_mcs   = vals[6];
+      dl_mod   = vals[7];
+      nr_arfcn = vals[15];
+      ul_rb    = vals[23];
+      ul_ri    = vals[24];
+      ul_mcs   = vals[25];
+      ul_mod   = vals[26];
+
+      /* 实测仅在控制信令/空口待机时 dl_mcs==0 && dl_mod<=2 && vals[10]<=5；有下行突发时 vals[2] 可为 0 但 vals[29]>=1 */
+      int dl_active = (dl_mcs > 0 || dl_mod > 2 || vals[10] > 5);
+      if (dl_active) {
+        int r1 = vals[2] + 1;
+        int r2 = vals[29];
+        dl_ri = (r1 > r2 ? r1 : r2);
+        if (dl_ri < 1) dl_ri = 1;
+        if (dl_ri > 4) dl_ri = 4;
+      } else {
+        dl_ri = 0;
+      }
+    }
+    g_free(res);
+    res = NULL;
+  }
+
+  /* 推导直观 MIMO 制式 (4x4 / 2x2 / 4R单流 / 待机 4R就绪) */
+  char mimo_label[48] = "未知";
+  if (dl_ri >= 4) {
+    snprintf(mimo_label, sizeof(mimo_label), "4x4 MIMO (4层)");
+  } else if (dl_ri == 3) {
+    snprintf(mimo_label, sizeof(mimo_label), "4x4 MIMO (3层)");
+  } else if (dl_ri == 2) {
+    snprintf(mimo_label, sizeof(mimo_label), "2x2 MIMO (2层)");
+  } else if (dl_ri == 1) {
+    snprintf(mimo_label, sizeof(mimo_label), active_ant_count >= 4 ? "4R 单流 (1层)" : "1x1 SISO (1层)");
+  } else if (active_ant_count >= 4) {
+    snprintf(mimo_label, sizeof(mimo_label), "4x4 就绪 (待机)");
+  } else if (active_ant_count >= 2) {
+    snprintf(mimo_label, sizeof(mimo_label), "2x2 就绪 (待机)");
+  } else if (!is_nr) {
+    snprintf(mimo_label, sizeof(mimo_label), "非 5G NR");
+  }
+
+  char ul_mimo_label[32] = "1T";
+  if (ul_ri >= 2) {
+    snprintf(ul_mimo_label, sizeof(ul_mimo_label), "2x2 UL MIMO (%d层)", ul_ri);
+  } else if (ul_ri == 1) {
+    snprintf(ul_mimo_label, sizeof(ul_mimo_label), "1T SISO (1层)");
+  }
+
+  int dl_bw_mhz = nr_rb_to_bw_mhz(dl_rb);
+
+  /* IMS / VoNR 注册状态 (每 10 秒缓存一次，避免增加 AT 负载) */
+  static time_t last_ims_poll = 0;
+  static int cached_ims_reg = 0;
+  static char cached_ims_caps[32] = "";
+  time_t now = time(NULL);
+  if (now - last_ims_poll >= 10) {
+    last_ims_poll = now;
+    if (execute_at("AT+CIREG?", &res) == 0 && res) {
+      cached_ims_reg = (strstr(res, "+CIREG:2,1") != NULL ||
+                        strstr(res, "+CIREG: 2,1") != NULL ||
+                        strstr(res, "+CIREG:1,1") != NULL ||
+                        strstr(res, "+CIREG: 1,1") != NULL);
+      cached_ims_caps[0] = '\0';
+      if (cached_ims_reg) {
+        const char *p = strstr(res, ",1,");
+        if (p) {
+          unsigned int bits = 0;
+          if (sscanf(p + 3, "%x", &bits) == 1) {
+            snprintf(cached_ims_caps, sizeof(cached_ims_caps), "%s%s",
+                     (bits & 0x01) ? "VoNR/VoLTE" : "IMS",
+                     (bits & 0x04) ? " + SMS" : "");
+          }
+        }
+        if (cached_ims_caps[0] == '\0') {
+          snprintf(cached_ims_caps, sizeof(cached_ims_caps), "IMS已注册");
+        }
+      }
+      g_free(res);
+      res = NULL;
+    }
+  }
+
+  /* 多点硬件温度 (sysfs 直读，0ms 开销) */
+  double soc_temp   = read_sysfs_int("/sys/class/thermal/thermal_zone0/temp", 0) / 1000.0;
+  double nrcp_temp  = read_sysfs_int("/sys/class/thermal/thermal_zone2/temp", 0) / 1000.0;
+  double pa5g_temp  = read_sysfs_int("/sys/class/thermal/thermal_zone8/temp", 0) / 1000.0;
+  double board_temp = read_sysfs_int("/sys/class/thermal/thermal_zone9/temp", 0) / 1000.0;
+
+  /* CPU 实时主频 (MHz) */
+  int cpu_freq_mhz = read_sysfs_int("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", 0) / 1000;
+
+  /* 有线网口 eth0 (RTL8168) 链路与速率状态 */
+  int eth_link = read_sysfs_int("/sys/class/net/eth0/carrier", 0);
+  int eth_speed = eth_link ? read_sysfs_int("/sys/class/net/eth0/speed", 0) : 0;
+  char eth_duplex[16] = "";
+  if (eth_link) {
+    read_sysfs_str("/sys/class/net/eth0/duplex", eth_duplex, sizeof(eth_duplex));
+  }
+
+  JsonBuilder *j = json_new();
+  json_obj_open(j);
+  json_add_int(j, "Code", 0);
+  json_add_str(j, "Error", "");
+  json_key_obj_open(j, "Data");
+  json_add_bool(j, "is_nr", is_nr);
+  json_add_bool(j, "has_ant", has_ant);
+  json_add_int(j, "active_ant_count", active_ant_count);
+  json_add_double(j, "ant0_rsrp", ant_rsrp[0]);
+  json_add_double(j, "ant1_rsrp", ant_rsrp[1]);
+  json_add_double(j, "ant2_rsrp", ant_rsrp[2]);
+  json_add_double(j, "ant3_rsrp", ant_rsrp[3]);
+  json_add_double(j, "ant0_sinr", ant_sinr[0]);
+  json_add_double(j, "ant1_sinr", ant_sinr[1]);
+  json_add_double(j, "ant2_sinr", ant_sinr[2]);
+  json_add_double(j, "ant3_sinr", ant_sinr[3]);
+  json_add_bool(j, "has_synch", has_synch);
+  json_add_int(j, "cqi", cqi);
+  json_add_int(j, "dl_ri", dl_ri);
+  json_add_int(j, "dl_rb", dl_rb);
+  json_add_int(j, "dl_bw_mhz", dl_bw_mhz);
+  json_add_int(j, "dl_mcs", dl_mcs);
+  json_add_int(j, "dl_mod", dl_mod);
+  json_add_str(j, "dl_mod_str", mod_order_to_str(dl_mod));
+  json_add_str(j, "mimo_label", mimo_label);
+  json_add_int(j, "nr_arfcn", nr_arfcn);
+  json_add_int(j, "ul_rb", ul_rb);
+  json_add_int(j, "ul_mcs", ul_mcs);
+  json_add_int(j, "ul_mod", ul_mod);
+  json_add_str(j, "ul_mod_str", mod_order_to_str(ul_mod));
+  json_add_int(j, "ul_ri", ul_ri);
+  json_add_str(j, "ul_mimo_label", ul_mimo_label);
+  json_add_bool(j, "ims_registered", cached_ims_reg);
+  json_add_str(j, "ims_caps", cached_ims_caps);
+  json_add_double(j, "soc_temp", soc_temp);
+  json_add_double(j, "nrcp_temp", nrcp_temp);
+  json_add_double(j, "pa5g_temp", pa5g_temp);
+  json_add_double(j, "board_temp", board_temp);
+  json_add_int(j, "cpu_freq_mhz", cpu_freq_mhz);
+  json_add_bool(j, "eth_link", eth_link ? 1 : 0);
+  json_add_int(j, "eth_speed", eth_speed);
+  json_add_str(j, "eth_duplex", eth_duplex);
+  json_obj_close(j);
+  json_obj_close(j);
+
+  HTTP_OK_FREE(c, json_finish(j));
+}
 #include "sms.h"
 
 /* GET /api/sms - 获取短信列表 */
@@ -855,28 +1085,11 @@ void handle_update_upload(struct mg_connection *c, struct mg_http_message *hm) {
   HTTP_ERROR(c, 400, "未找到上传文件");
 }
 
-/* POST /api/update/download - 从URL下载更新包 */
+/* POST /api/update/download - RM500U-CN 已禁用远程下载升级 */
 void handle_update_download(struct mg_connection *c,
                             struct mg_http_message *hm) {
   HTTP_CHECK_POST(c, hm);
-
-  char url[512] = {0};
-  char *url_str = mg_json_get_str(hm->body, "$.url");
-  if (url_str) {
-    strncpy(url, url_str, sizeof(url) - 1);
-    free(url_str);
-  }
-
-  if (strlen(url) == 0) {
-    HTTP_ERROR(c, 400, "URL参数不能为空");
-    return;
-  }
-
-  if (update_download(url) == 0) {
-    HTTP_SUCCESS(c, "下载成功");
-  } else {
-    HTTP_ERROR(c, 500, "下载失败");
-  }
+  HTTP_ERROR(c, 403, "RM500U-CN 已禁用远程在线下载升级");
 }
 
 /* POST /api/update/extract - 解压更新包 */
@@ -919,31 +1132,21 @@ void handle_update_install(struct mg_connection *c,
   }
 }
 
-/* GET /api/update/check - 检查远程版本 */
+/* GET /api/update/check - 已禁用外部 Gitee OTA 检查 */
 void handle_update_check(struct mg_connection *c, struct mg_http_message *hm) {
   HTTP_CHECK_ANY(c, hm);
-
-  const char *check_url = UPDATE_CHECK_URL;
-
-  update_info_t info;
-  if (update_check_version(check_url, &info) == 0) {
-    const char *current = update_get_version();
-    int has_update = strcmp(info.version, current) > 0 ? 1 : 0;
-
-    JsonBuilder *j = json_new();
-    json_obj_open(j);
-    json_add_str(j, "current_version", current);
-    json_add_str(j, "latest_version", info.version);
-    json_add_bool(j, "has_update", has_update);
-    json_add_str(j, "url", info.url);
-    json_add_str(j, "changelog", info.changelog);
-    json_add_ulong(j, "size", (unsigned long)info.size);
-    json_add_bool(j, "required", info.required);
-    json_obj_close(j);
-    HTTP_OK_FREE(c, json_finish(j));
-  } else {
-    HTTP_ERROR(c, 500, "检查版本失败");
-  }
+  const char *current = update_get_version();
+  JsonBuilder *j = json_new();
+  json_obj_open(j);
+  json_add_str(j, "current_version", current);
+  json_add_str(j, "latest_version", current);
+  json_add_bool(j, "has_update", 0);
+  json_add_str(j, "url", "");
+  json_add_str(j, "changelog", "");
+  json_add_ulong(j, "size", 0);
+  json_add_bool(j, "required", 0);
+  json_obj_close(j);
+  HTTP_OK_FREE(c, json_finish(j));
 }
 
 /* 已删除 /api/update/config - 版本检查URL已嵌入程序 */
@@ -1437,7 +1640,7 @@ void handle_plugin_delete_all(struct mg_connection *c,
 
 /* ==================== 脚本管理 API ==================== */
 
-#define SCRIPTS_DIR "/home/root/6677/Plugins/scripts"
+#define SCRIPTS_DIR "./Plugins/scripts"
 
 /* GET /api/scripts - 获取脚本列表 */
 void handle_script_list(struct mg_connection *c, struct mg_http_message *hm) {
@@ -2894,7 +3097,8 @@ void handle_ipv6_proxy_status(struct mg_connection *c,
   /* 生成访问链接 */
   char link[128] = "";
   if (strlen(status.ipv6_addr) > 0) {
-    snprintf(link, sizeof(link), "http://[%s]:6677", status.ipv6_addr);
+    extern const char *http_server_get_port(void);
+    snprintf(link, sizeof(link), "http://[%s]:%s", status.ipv6_addr, http_server_get_port());
   }
   json_add_str(j, "link", link);
 

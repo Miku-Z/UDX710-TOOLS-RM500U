@@ -1,300 +1,78 @@
-# 5G MiFi Dashboard(UDX710)
+# RM500U-CN Dashboard (UDX710-TOOLS Fork)
 
 [🇨🇳 中文文档](README_CN.md)
 
-A web-based management interface for 5G MiFi devices running on embedded Linux systems (aarch64).
+A customized lightweight 5G web management dashboard based on [LeoChen-CoreMind/UDX710-TOOLS](https://github.com/LeoChen-CoreMind/UDX710-TOOLS), adapted for **RM500U-CN (UNISOC UDX710)** modules with PCIe Ethernet adapter boards (e.g. RTL8168 / `eth0`).
 
-> ⭐ **If you find this project useful, please give it a star!** It took a week of hard work to build this backend. Your support means a lot!
+---
 
-## 📦 Versions
+## Key Changes vs. Upstream
 
-This project provides two versions for different devices:
+### 1. Enhanced 5G NR Radio & Hardware Monitoring (`/api/nr_radio_detail`)
+- **4-Antenna Telemetry**: Live per-antenna `ANT0–ANT3` RSRP and SINR readings.
+- **Accurate MIMO / Modulation / MCS / Bandwidth Reporting**:
+  - Fixed `AT+SP5GCMDS="get nr synch_param",16` field mapping with non-NR guards;
+  - Resolved false "idle/standby" MIMO reporting during active downloads and fixed downlink-rank/uplink-rank index swap (`4R 单流 (1层)`, `2x2 MIMO (2层)`, `4x4 MIMO (3层/4层)`, `4x4 就绪 (待机)`);
+  - Added channel bandwidth (MHz / RB), Point-A ARFCN, and IMS registration status (`VoNR/VoLTE + SMS`);
+  - Independent **2.5s** non-overlapping polling loop on the frontend for `/api/nr_radio_detail`.
+- **Thermal, CPU & Ethernet Link**: Multi-zone thermal sensors (SoC, NRCP, PA5G, Board), CPU frequency, `eth0` link speed/duplex, and fixed RAM cache calculation.
 
-| Version | Target Device | Git Branch | Features | Description |
-|:---:|:---:|:---:|:---:|:---|
-| **UDX710 Generic** | UNISOC UDX710 Platform | `main` | ⭐ Basic Features | For most UDX710 devices |
-| **SZ50 Dedicated** | SZ50 MiFi Device | `SZ50` | 🌟 Full Features | Extra: LED Control, Key Listener, WiFi Control, Factory Reset, Client Management |
+### 2. 5G SA SMS TX/RX Fixes
+- Automatically enables `AT+IMSEN=1`, configures `AT+CPMS="ME","ME","ME"` and `AT+CNMI=2,1,0,0,0` without manual AT intervention.
+- Added background `ME -> SQLite` PDU drainer with 5s deduplication, concatenated SMS **UDH reassembly**, and real `MessageState` delivery tracking.
+- Removed the legacy "R106 SMS fix" manual toggle.
 
-> 💡 **Switch Version**: `git checkout SZ50` for SZ50 version, `git checkout main` for generic version
+### 3. RM500U-CN Platform Adaptation & Cleanup
+- **System Info & Network Mode**: Reads model/firmware from `/etc/quectel-project-name` (fallback `AT+CGMR`), supports hexadecimal `/proc/cpuinfo` `Serial`, prefers `org.ofono.RadioSettings` with `AT+SPTESTMODE` fallback, and uses `AT+SPENGMD` fallback for primary serving band.
+- **USB Mode Switching**: Replaced risky configfs/IPA hot-switching with `/mnt/data/usbenum.ini` (`virtualcn`) + `sync()`, supporting **RNDIS / CDC-ECM / CDC-NCM / MBIM** (takes effect on reboot).
+- **net-tools 2.x Compatibility**: Updated `ifconfig` parser for `eth0:` trailing colons and `ether` MAC format.
+- **Hardware Cleanup**: Disabled battery/charging controls, phone-case mode, OTA update popups, and unused SIM Slot 2 UI.
+- **Relocatable Deployment**: Relative `./` lookup for `vnstat`, `rathole`, and `Plugins` with configurable listen port (`./server <port>`).
 
-### 📥 Download
+---
 
-| Version | Download |
-|:---:|:---:|
-| **UDX710 Generic** | [📥 Download](https://github.com/LeoChen-CoreMind/UDX710-TOOLS/releases/latest) |
-| **SZ50 Dedicated** | [📥 Download](https://github.com/LeoChen-CoreMind/UDX710-TOOLS/releases/latest) |
+## Build
 
-### SZ50 Dedicated Version Extra Features
-- 🔆 **LED Control** - Customize LED indicator status
-- 🔘 **Key Listener** - Physical button event response
-- 📶 **WiFi Control** - Full WiFi AP management
-- 🔄 **Factory Reset** - One-click restore to defaults
-- 👥 **Client Management** - Manage connected devices
+### GitHub Actions
+Push to trigger [`.github/workflows/build.yml`](.github/workflows/build.yml), which builds both frontend and `aarch64` backend using the official ARM GNU Toolchain 9.2 (`aarch64-none-linux-gnu-gcc`, targeting `GLIBC 2.30`, compatible with module `GLIBC 2.31`) and uploads a ready-to-deploy artifact (`server`, `dist/`, `start.sh`).
 
-## ✨ Performance Highlights
+### Local Cross-Compilation
+> Note: The target module firmware runs `GLIBC 2.31`. Use a toolchain targeting `GLIBC <= 2.31` (such as ARM GCC 9.2) rather than newer Ubuntu host compilers that emit `GLIBC_2.34+` symbols.
 
-| Metric | This Project | Traditional (8080) |
-|--------|-------------|-------------------|
-| **Binary Size** | ~200 KB | ~6 MB |
-| **Memory Usage** (7h runtime) | ~1 MB | Much higher |
-
-Lightweight, efficient, and perfect for resource-constrained embedded devices!
-
-## 📸 Screenshots
-
-| System Monitor | Network Management | Advanced Network |
-|:---:|:---:|:---:|
-| <img src="docs/screenshot1.png" width="250" /> | <img src="docs/screenshot2.png" width="250" /> | <img src="docs/screenshot3.png" width="250" /> |
-
-| SMS Management | Traffic Statistics | Charge Control |
-|:---:|:---:|:---:|
-| <img src="docs/screenshot5.png" width="250" /> | <img src="docs/screenshot6.png" width="250" /> | <img src="docs/screenshot7.png" width="250" /> |
-
-| System Update | AT Debug | Web Terminal |
-|:---:|:---:|:---:|
-| <img src="docs/screenshot8.png" width="250" /> | <img src="docs/screenshot9.png" width="250" /> | <img src="docs/screenshot10.png" width="250" /> |
-
-| USB Mode | System Settings |
-|:---:|:---:|
-| <img src="docs/screenshot11.png" width="250" /> | <img src="docs/screenshot12.png" width="250" /> |
-
-| APN Settings | Plugin Store |
-|:---:|:---:|
-| <img src="docs/screenshot13.png" width="250" /> | <img src="docs/screenshot14.png" width="250" /> |
-
-## Features
-
-### Network Management
-- **Modem Control**: View IMEI, ICCID, carrier info, signal strength
-- **Band Information**: Real-time display of network type, band, ARFCN, PCI, RSRP, RSRQ, SINR
-- **Cell Management**: View and manage cellular connections
-- **Traffic Statistics**: Monitor data usage with vnstat integration
-- **Traffic Control**: Set data limits and automatic network cutoff
-
-### WiFi Management
-- **AP Mode**: Configure WiFi hotspot (SSID, password, channel)
-- **Client Management**: View connected devices, kick clients
-- **DHCP Settings**: Configure IP range and lease time
-
-### System Features
-- **System Monitor**: CPU, memory, temperature monitoring (IMEI/ICCID privacy masking)
-- **SMS Management**: Send and receive SMS messages, Webhook forwarding support
-- **IPv6 Port Forwarding**: Full IPv6 port forwarding service
-  - Map local IPv4 ports to IPv6 addresses
-  - Automatic IPv6 address detection
-  - Webhook notification for IPv6 address changes
-  - Auto-start on boot support
-  - Send logs with response tracking
-- **Intranet Penetration (Rathole)**: Built-in Rathole client for NAT traversal
-  - Multi-service configuration
-  - Auto-generate server config
-  - Real-time connection status
-  - Auto-start on boot support
-- **LED Control**: Manage device LED indicators
-- **Airplane Mode**: Toggle airplane mode
-- **Power Management**: Battery status, charging control
-- **USB Mode Switch**: Switch between CDC-ECM, CDC-NCM, RNDIS USB network modes
-  - Temporary mode: Effective after reboot, reverts on next reboot
-  - Permanent mode: Persists across all reboots
-- **APN Settings**: Custom APN access point configuration
-  - Preset carrier configurations (China Mobile/Unicom/Telecom)
-  - Custom APN, username, password
-  - Multiple authentication protocols (PAP/CHAP)
-- **Plugin Store**: Extensible plugin system
-  - Support custom JS+HTML plugins
-  - Built-in Shell script execution API
-  - Script management (upload/edit/delete)
-  - Plugin import/export functionality
-- **OTA Update**: Over-the-air firmware updates
-- **Factory Reset**: Restore device to default settings
-- **Web Terminal**: Remote shell access
-- **AT Debug**: Direct AT command interface
-
-### UI Features
-- **Dark Mode**: Full dark/light theme support
-- **Responsive Design**: Mobile and desktop optimized
-- **Real-time Updates**: Live data refresh
-- **Chinese Interface**: Native Chinese language support
-
-### Security Features
-- **Backend Authentication**: Password-protected admin interface
-  - Default password: `admin` (recommended to change after first login)
-  - Token-based authentication with auto-expiration
-  - Remember password option
-  - Password change support
-
-## Architecture
-
-```
-├── src/                    # Backend (C)
-│   ├── main.c              # Entry point
-│   ├── mongoose.c/h        # HTTP server (Mongoose)
-│   ├── packed_fs.c         # Embedded static files
-│   ├── handlers/           # HTTP API handlers
-│   │   ├── http_server.c   # Route definitions
-│   │   └── handlers.c      # API implementations
-│   └── system/             # System modules
-│       ├── sysinfo.c       # System information
-│       ├── wifi.c          # WiFi control
-│       ├── sms.c           # SMS management
-│       ├── traffic.c       # Traffic statistics
-│       ├── modem.c         # Modem control
-│       ├── ofono.c         # oFono D-Bus integration
-│       ├── led.c           # LED control
-│       ├── charge.c        # Battery management
-│       ├── airplane.c      # Airplane mode
-│       ├── usb_mode.c      # USB mode switch
-│       ├── plugin.c        # Plugin system
-│       ├── update.c        # OTA updates
-│       ├── factory_reset.c # Factory reset
-│       └── ...
-└── web/                    # Frontend (Vue 3)
-    ├── src/
-    │   ├── App.vue         # Main application
-    │   ├── components/     # Vue components
-    │   ├── composables/    # Vue composables
-    │   └── plugins/        # Plugins (FontAwesome)
-    ├── index.html
-    ├── package.json
-    ├── vite.config.js
-    └── tailwind.config.js
-```
-
-## Requirements
-
-### Backend
-- GCC cross-compiler (aarch64-linux-gnu)
-- GLib 2.0 (D-Bus support)
-- Target: Linux aarch64 (embedded device)
-
-### Frontend
-- Node.js 18+
-- npm or yarn
-
-## Build Instructions
-
-### Frontend
 ```bash
+# 1. Build frontend
 cd web
 npm install
 npm run build
+
+# 2. Cross-compile backend (aarch64)
+cd ../src
+make CC=aarch64-none-linux-gnu-gcc STRIP=aarch64-none-linux-gnu-strip
+# Output: src/build/ofono-server
 ```
 
-### Backend
-```bash
-# Pack frontend into C source
-cd src
-# Generate packed_fs.c from web/dist
+---
 
-# Cross-compile for aarch64
-make
-```
+## Deployment
 
-### Makefile Configuration
-The backend uses cross-compilation targeting aarch64-linux-gnu. Ensure your toolchain is properly configured.
+1. Copy `src/build/ofono-server` (as `server`) and `web/dist/` to your module directory (e.g. `/home/root/6677/` or `/home/root/6688/`).
+2. If upgrading an existing installation, replacing `server` and `dist/` preserves existing databases and runtime utilities; for a fresh directory, provide `vnstat`, `vnstatd`, `vnstatd.conf`, and `rathole` if traffic/tunnel features are needed (`sqlite3` is typically preinstalled on the module).
+3. Start the server (default port `6677`, or pass a custom port):
+   ```sh
+   chmod +x server start.sh
+   ./start.sh 6688
+   ```
+4. Open `http://<module-ip>:6688` (default password: `admin`).
 
-## API Endpoints
+### Prerequisites
+- This repository only provides the WebUI and backend server; PCIe NIC kernel drivers (e.g. `r8169.ko` / `yt6801.ko`) and board-level network init scripts are out of scope.
+- 5G SA SMS requires VoLTE / IMS SMS service enabled on your SIM plan.
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/sysinfo` | GET | System information |
-| `/api/wifi/config` | GET/POST | WiFi configuration |
-| `/api/wifi/clients` | GET | Connected clients |
-| `/api/sms/list` | GET | SMS messages |
-| `/api/sms/send` | POST | Send SMS |
-| `/api/traffic/stats` | GET | Traffic statistics |
-| `/api/traffic/limit` | POST | Set traffic limit |
-| `/api/modem/info` | GET | Modem information |
-| `/api/band/current` | GET | Current band info |
-| `/api/led/status` | GET/POST | LED control |
-| `/api/airplane` | GET/POST | Airplane mode |
-| `/api/usb/mode` | GET/POST | USB mode switch (CDC-ECM/CDC-NCM/RNDIS) |
-| `/api/apn` | GET/POST | APN configuration management |
-| `/api/plugins` | GET/POST/DELETE | Plugin management |
-| `/api/scripts` | GET/POST/PUT/DELETE | Script management |
-| `/api/shell` | POST | Execute Shell commands |
-| `/api/ipv6-proxy/config` | GET/POST | IPv6 proxy configuration |
-| `/api/ipv6-proxy/rules` | GET/POST/DELETE | IPv6 forwarding rules |
-| `/api/ipv6-proxy/status` | GET | IPv6 proxy status |
-| `/api/ipv6-proxy/send-logs` | GET | IPv6 send logs |
-| `/api/rathole/config` | GET/POST | Rathole configuration |
-| `/api/rathole/services` | GET/POST/DELETE | Rathole service management |
-| `/api/rathole/status` | GET | Rathole connection status |
-| `/api/rathole/logs` | GET | Rathole logs |
-| `/api/update/check` | GET | Check for updates |
-| `/api/update/install` | POST | Install update |
-| `/api/factory-reset` | POST | Factory reset |
-| `/api/reboot` | POST | Reboot device |
+---
 
-## Dependencies
+## Attribution, Modifications & License
 
-### Backend Libraries
-- [Mongoose](https://github.com/cesanta/mongoose) - Embedded HTTP server
-- GLib/GIO - D-Bus communication with oFono
-
-### Frontend Libraries
-- Vue 3 - UI framework
-- Vite - Build tool
-- TailwindCSS - Styling
-- FontAwesome - Icons
-
-## 🌐 Remote Management
-
-Built-in lightweight Web Server for browser-based control interface.
-
-**Features**: Device status cards, real-time monitoring, network control & debugging
-
-| Version | Default Access |
-|:---:|:---|
-| UDX710 Generic | `http://DEVICE_IP:6677` |
-| SZ50 Dedicated | `http://DEVICE_IP:80` |
-
-```bash
-# Start server (default port)
-./server
-
-# Start with custom port
-./server 80
-```
-
-## 📜 License
-
-This project is licensed under **GPLv3** (strong Copyleft):
-
-| ✅ Allowed | ⚠️ Required | ❌ Prohibited |
-|:---|:---|:---|
-| Use, modify, distribute | Keep copyright notices | Closed-source commercialization |
-| Distribute modified versions | Open source (when distributing) | Remove copyright info |
-| | Use same license | Change to other licenses |
-
-See [LICENSE](LICENSE)
-
-## 🙏 Acknowledgments
-
-Special thanks to the following contributors:
-
-| Contributor | Contribution |
-|:---:|:---|
-| **等不住** | AT Commands |
-| **黑衣剑士** | USB Mode Switch |
-| **Voodoo** | Glib Build Environment |
-| **1orz** | [project-cpe](https://github.com/1orz/project-cpe) Open Source Project |
-| **LeoChen** | Project Author |
-
-Thanks to all community members for your support and feedback!
-
-## ☕ Support the Project
-
-This project is completely open source and free. If you like this project, you can buy me a coffee~
-
-| Alipay | WeChat | QQ Group |
-|:---:|:---:|:---:|
-| <img src="docs/alipay.png" width="200" /> | <img src="docs/wechat.png" width="200" /> | <img src="docs/qq_group.png" width="200" /> |
-
-## 💬 Community
-
-Welcome to join the discussion!
-
-- **QQ Group**: 1029148488
-
-Welcome to submit Issues / Pull Requests to improve the project 💡
+- **Upstream Project**: Derived from [LeoChen-CoreMind/UDX710-TOOLS](https://github.com/LeoChen-CoreMind/UDX710-TOOLS). Original copyright belongs to the upstream authors and contributors.
+- **Notice of Modification**: This fork was modified in **November 2026** for RM500U-CN hardware adaptation, 5G SA SMS support, and 4-antenna NR telemetry.
+- **License**: Released under the **GNU General Public License v3.0 (GPLv3)** — see [LICENSE](LICENSE) for full terms.
+- **Disclaimer**: Provided "AS-IS" without warranty of any kind. Band locking, USB mode changes, and system modifications are performed at your own risk.

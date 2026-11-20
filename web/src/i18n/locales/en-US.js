@@ -77,7 +77,7 @@ export default {
 
   // Header
   header: {
-    title: '5G-MIFI',
+    title: 'RM500U-CN',
     subtitle: 'Dashboard',
     realtimeMonitor: 'Real-time device monitoring',
     openSource: 'Open Source'
@@ -753,6 +753,7 @@ export default {
     rebootTitle: 'Reboot Device',
     rebootMsgPerm: 'Reboot required to take effect. Reboot now?',
     rebootMsgTemp: 'Reboot now to apply changes?',
+    mbimDesc: 'Native mobile broadband protocol for Windows 10/11 & Linux (virtualcn=3); host triggers dial-up.',
     rebooting: 'System is rebooting...',
     notes: 'Notes',
     noteHot: 'Hot Switch: Takes effect immediately, USB disconnects briefly (~2s)',

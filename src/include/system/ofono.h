@@ -8,6 +8,16 @@
 
 #include <gio/gio.h>
 
+/* 使用独立符号前缀以避免与系统库导出符号冲突 */
+#define ofono_init                        webui_ofono_init
+#define ofono_deinit                      webui_ofono_deinit
+#define ofono_get_datacard                webui_ofono_get_datacard
+#define ofono_set_datacard                webui_ofono_set_datacard
+#define ofono_modem_set_online            webui_ofono_modem_set_online
+#define ofono_network_get_mode_sync       webui_ofono_network_get_mode_sync
+#define ofono_network_set_mode_sync       webui_ofono_network_set_mode_sync
+#define ofono_network_get_signal_strength webui_ofono_network_get_signal_strength
+
 #ifdef __cplusplus
 extern "C" {
 #endif
