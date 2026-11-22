@@ -4,6 +4,8 @@
 
 A customized lightweight 5G web management dashboard based on [LeoChen-CoreMind/UDX710-TOOLS](https://github.com/LeoChen-CoreMind/UDX710-TOOLS), adapted for **RM500U-CN (UNISOC UDX710)** modules with PCIe Ethernet adapter boards (e.g. RTL8168 / `eth0`).
 
+![RM500U-CN Dashboard System Monitor Preview](docs/preview.jpg)
+
 ---
 
 ## Key Changes vs. Upstream

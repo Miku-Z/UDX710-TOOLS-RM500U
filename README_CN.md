@@ -4,6 +4,8 @@
 
 基于开源项目 [LeoChen-CoreMind/UDX710-TOOLS](https://github.com/LeoChen-CoreMind/UDX710-TOOLS) 修改适配，面向 **RM500U-CN（UNISOC UDX710 平台）+ 有线网卡转接板（如 PCIe RTL8168 / eth0）** 的轻量级嵌入式 5G Web 管理后台。
 
+![RM500U-CN 管理中心系统监控预览](docs/preview.jpg)
+
 ---
 
 ## 相比原版的主要改动
